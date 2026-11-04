@@ -124,6 +124,7 @@ jobs:
           java -Xmx5g -jar "$CLI" patch \
             -p "$BUNDLE" \
               -e "Run beside the store app" \
+              -e "Look like the store app" \
               -e "Change app name" -OappName="${{ inputs.app_name }}" \
             -p "$MORPHE_BUNDLE" \
               -e "Clone app" -OpackageName="$CLONE_PACKAGE" \
