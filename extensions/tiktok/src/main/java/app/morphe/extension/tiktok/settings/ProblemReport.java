@@ -27,7 +27,8 @@ import app.morphe.extension.shared.Utils;
  * serial or a file path: titles, versions and the model only.
  */
 public final class ProblemReport {
-    static final String NEW_ISSUE_URL = "https://github.com/SysAdminDoc/HushFeed/issues/new";
+    // CleancutTok: reports go to this fork, not to Hushfeed, which doesn't ship this build.
+    static final String NEW_ISSUE_URL = app.morphe.extension.tiktok.cleancut.Brand.NEW_ISSUE_URL;
     /** The bug form in .github/ISSUE_TEMPLATE, whose field ids the link fills. */
     static final String TEMPLATE = "bug_report.yml";
     /** The form's own title prefix; the reporter adds the rest. */

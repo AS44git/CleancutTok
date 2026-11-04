@@ -19,7 +19,8 @@ public final class MorpheTikTokAboutPreference extends Preference
      * "version" found nothing even though the row carries it.
      */
     public static final String KEY = "action_about";
-    public static final String SOURCE_URL = "https://github.com/SysAdminDoc/hushfeed";
+    // CleancutTok: the source of this build (GPLv3). Hushfeed is credited in the license notice.
+    public static final String SOURCE_URL = app.morphe.extension.tiktok.cleancut.Brand.SOURCE_URL;
 
     public MorpheTikTokAboutPreference(Context context) {
         this(context, Utils.getPatchesReleaseVersion(), Utils.getAppVersionName());

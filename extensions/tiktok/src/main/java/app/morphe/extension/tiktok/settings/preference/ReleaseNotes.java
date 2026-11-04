@@ -34,7 +34,7 @@ public final class ReleaseNotes {
     static final String KEY = "action_release_notes";
     public static final String PREFS_NAME = "hushfeed_release_notes";
     private static final String DISMISSED = "dismissed_version";
-    private static final String CHANGELOG_URL = "https://github.com/SysAdminDoc/hushfeed/blob/main/CHANGELOG.md";
+    private static final String CHANGELOG_URL = app.morphe.extension.tiktok.cleancut.Brand.SOURCE_URL + "/releases";
     private static final Pattern VERSION = Pattern.compile("^(\\d+)\\.(\\d+)\\.(\\d+)(\\S*)");
     private static final Pattern HEADING = Pattern.compile("(?m)^## (\\d+\\.\\d+\\.\\d+) ");
 

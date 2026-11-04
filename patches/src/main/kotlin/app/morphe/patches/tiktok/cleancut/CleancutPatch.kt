@@ -10,9 +10,11 @@ import app.morphe.patcher.Fingerprint
 import app.morphe.patcher.extensions.InstructionExtensions.getInstruction
 import app.morphe.patcher.extensions.InstructionExtensions.instructions
 import app.morphe.patcher.patch.PatchException
+import app.morphe.patcher.patch.resourcePatch
 import app.morphe.patcher.util.smali.ExternalLabel
 import app.morphe.patches.shared.compat.AppCompatibilities
 import app.morphe.patches.tiktok.interaction.blockauthor.blockAuthorPatch
+import app.morphe.patches.tiktok.misc.extension.MainActivityOnCreateFingerprint
 import app.morphe.patches.tiktok.misc.extension.sharedExtensionPatch
 import app.morphe.patches.tiktok.misc.navigation.feedTabNavigationPatch
 import app.morphe.patches.tiktok.misc.settings.configurableBytecodePatch as bytecodePatch
@@ -27,8 +29,31 @@ import com.android.tools.smali.dexlib2.Opcode
 import com.android.tools.smali.dexlib2.iface.ClassDef
 import com.android.tools.smali.dexlib2.iface.reference.StringReference
 import com.android.tools.smali.dexlib2.iface.reference.TypeReference
+import org.w3c.dom.Element
 
 private const val EXTENSION = "Lapp/morphe/extension/tiktok/cleancut/Cleancut;"
+private const val UPDATER = "Lapp/morphe/extension/tiktok/cleancut/Updater;"
+private const val INSTALL_PERMISSION = "android.permission.REQUEST_INSTALL_PACKAGES"
+
+/**
+ * Lets the updater hand a downloaded release to Android's package installer. TikTok doesn't
+ * declare it; without it the installer refuses the session.
+ */
+private val installPermissionPatch = resourcePatch {
+    execute {
+        document("AndroidManifest.xml").use { xml ->
+            val manifest = xml.documentElement
+            val permissions = xml.getElementsByTagName("uses-permission")
+            val declared = (0 until permissions.length)
+                .any { (permissions.item(it) as Element).getAttribute("android:name") == INSTALL_PERMISSION }
+            if (!declared) {
+                val element = xml.createElement("uses-permission")
+                element.setAttribute("android:name", INSTALL_PERMISSION)
+                manifest.insertBefore(element, manifest.firstChild)
+            }
+        }
+    }
+}
 
 /**
  * The one method that picks every video page's list source (its "operator"), outside the home
@@ -68,7 +93,7 @@ val cleancutPatch = bytecodePatch(
         "turns it off.",
 ) {
     category("CleancutTok")
-    dependsOn(settingsPatch, sharedExtensionPatch, feedTabNavigationPatch, blockAuthorPatch)
+    dependsOn(settingsPatch, sharedExtensionPatch, feedTabNavigationPatch, blockAuthorPatch, installPermissionPatch)
     compatibleWith(*AppCompatibilities.tiktok())
 
     execute {
@@ -106,6 +131,13 @@ val cleancutPatch = bytecodePatch(
                 return-object v0
             """,
             ExternalLabel("cleancut_keep_list", factory.getInstruction(0)),
+        )
+
+        // Updates: a quiet check of this repository's latest release a few seconds after the
+        // main screen opens.
+        MainActivityOnCreateFingerprint.method.addInstruction(
+            0,
+            "invoke-static/range {p0 .. p0}, $UPDATER->onMainActivity(Landroid/app/Activity;)V",
         )
 
         // Layers 1 and 4 (the bottom bar, the start tab and the locked settings) live in the
