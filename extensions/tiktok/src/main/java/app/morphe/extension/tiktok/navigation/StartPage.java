@@ -81,6 +81,17 @@ public final class StartPage {
      * intent started it and the state Android handed back, if any.
      */
     public static String coldStartTag(Activity activity, String tag, Bundle savedState) {
+        String picked = hushfeedColdStartTag(activity, tag, savedState);
+        try {
+            // CleancutTok: a start that would land on a feed lands on Inbox, from any route.
+            return app.morphe.extension.tiktok.cleancut.Cleancut.startTag(picked, signedIn());
+        } catch (Throwable failure) {
+            Logger.printException(() -> "CleancutTok start tab failed", failure);
+            return picked;
+        }
+    }
+
+    private static String hushfeedColdStartTag(Activity activity, String tag, Bundle savedState) {
         try {
             HookStatus.bound(FAMILY, "cold start");
             startTopTab = null;

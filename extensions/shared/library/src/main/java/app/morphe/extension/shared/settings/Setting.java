@@ -208,6 +208,23 @@ public abstract class Setting<T> {
     /** Hushfeed's own state rather than a change to TikTok: it keeps its value while paused. */
     private volatile boolean keptWhenPaused;
 
+    /**
+     * CleancutTok's permanent lock: a value this build always answers, whatever is saved, paused
+     * or imported. Set once as the settings load and never cleared, so nothing in the app can
+     * turn it off.
+     */
+    private volatile T lockedValue;
+
+    /** Locks this setting to {@code locked} for the life of the process. */
+    public final void lockTo(@NonNull T locked) {
+        lockedValue = coerce(Objects.requireNonNull(locked));
+    }
+
+    /** Whether CleancutTok's permanent lock holds this setting. */
+    public final boolean isLocked() {
+        return lockedValue != null;
+    }
+
     /** Whether this process runs with Hushfeed paused. */
     public static boolean isPaused() {
         return pausedForProcess;
@@ -413,6 +430,10 @@ public abstract class Setting<T> {
                 return false;
             }
             newValue = coerce(Objects.requireNonNull(newValue));
+            if (lockedValue != null) {
+                // The permanent lock: the saved value can't move away from it.
+                return lockedValue.equals(newValue);
+            }
             if (value.equals(newValue)) {
                 return true;
             }
@@ -463,6 +484,8 @@ public abstract class Setting<T> {
      */
     @NonNull
     public final T get() {
+        T locked = lockedValue;
+        if (locked != null) return locked;
         return pausedForProcess && !keptWhenPaused ? pausedValue() : currentValue();
     }
 
@@ -482,7 +505,8 @@ public abstract class Setting<T> {
      */
     @NonNull
     public final T savedValue() {
-        return value;
+        T locked = lockedValue;
+        return locked != null ? locked : value;
     }
 
     /**

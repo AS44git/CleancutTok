@@ -226,6 +226,14 @@ public final class NavigationTabsFilter {
                 return tabs;
             }
 
+            // CleancutTok: Inbox and Profile only, whatever the settings say.
+            List<?> cut = app.morphe.extension.tiktok.cleancut.Cleancut.bottomTabs(tabs);
+            if (cut != tabs) {
+                liveBottomTabHidden = hasLiveTab(tabs) && !hasLiveTab(cut);
+                debugBottomTabs("cleancut", tabs, cut);
+                return cut;
+            }
+
             Set<String> previousObservedKeys = BottomNavigationTabOptions.parseObservedKeys(
                     Settings.BOTTOM_NAVIGATION_OBSERVED_TABS.get()
             );

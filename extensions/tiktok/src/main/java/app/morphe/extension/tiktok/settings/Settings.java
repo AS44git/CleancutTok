@@ -1564,4 +1564,9 @@ public class Settings extends BaseSettings {
     public static boolean shouldHideShareGuide() {
         return HIDE_SHARE_GUIDE.get();
     }
+
+    // CleancutTok's permanent lock. Last in the class, so every setting above exists first.
+    static {
+        app.morphe.extension.tiktok.cleancut.Cleancut.lockSettings();
+    }
 }
