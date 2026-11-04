@@ -1,3 +1,16 @@
+CleancutTok NOTICE
+==================
+
+CleancutTok is a modified version of Hushfeed
+(https://github.com/SysAdminDoc/hushfeed), forked at commit
+b423406498b0df395235d9c963b48b4791e6d180 (2026-11-04). It is not affiliated
+with Hushfeed, Morphe, TikTok or ByteDance. Hushfeed's own notice, including
+every upstream notice it carries, follows unchanged.
+
+Copyright (C) Hushfeed contributors and the upstream projects named below.
+Copyright (C) CleancutTok contributors (modifications).
+
+
 Hushfeed NOTICE
 ===============
 
