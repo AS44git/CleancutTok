@@ -300,4 +300,73 @@ public final class Cleancut {
     private static String asString(Object value) {
         return value == null ? null : value.toString();
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Favourites (diagnostics). Logs the shape of each Favourites > Videos page: numbers and
+    // field names only, never captions, names or other text.
+    // ---------------------------------------------------------------------------------------
+
+    private static int favoritesPages;
+
+    public static void favoritesPage(Object response) {
+        try {
+            if (response == null) return;
+            int page = ++favoritesPages;
+            StringBuilder b = new StringBuilder("favourites page ").append(page).append(": ");
+            b.append(response.getClass().getName()).append(' ');
+            java.util.List<?> items = null;
+            for (Class<?> c = response.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                    f.setAccessible(true);
+                    Object v = f.get(response);
+                    if (v instanceof java.util.List) {
+                        b.append(f.getName()).append("=[").append(((java.util.List<?>) v).size()).append("] ");
+                        if (items == null) items = (java.util.List<?>) v;
+                    } else if (v instanceof Number || v instanceof Boolean) {
+                        b.append(f.getName()).append('=').append(v).append(' ');
+                    } else {
+                        b.append(f.getName()).append(':').append(v == null ? "null" : v.getClass().getSimpleName()).append(' ');
+                    }
+                }
+            }
+            android.util.Log.i("CleancutTok", b.toString());
+            if (items != null && !items.isEmpty()) {
+                describeItem("  first item", items.get(0), page == 1);
+                describeItem("  last item", items.get(items.size() - 1), false);
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("CleancutTok", "favourites page: " + t);
+        }
+    }
+
+    private static void describeItem(String label, Object item, boolean withFieldNames) throws IllegalAccessException {
+        if (item == null) return;
+        StringBuilder b = new StringBuilder(label).append(": ").append(item.getClass().getName()).append(' ');
+        for (Class<?> c = item.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                f.setAccessible(true);
+                Object v = f.get(item);
+                if (v instanceof Number || v instanceof Boolean) {
+                    b.append(f.getName()).append('=').append(v).append(' ');
+                } else if (v != null && v.getClass().getName().endsWith(".Aweme")) {
+                    b.append(f.getName()).append(":Aweme(");
+                    for (java.lang.reflect.Field af : v.getClass().getDeclaredFields()) {
+                        String n = af.getName();
+                        if (!java.lang.reflect.Modifier.isStatic(af.getModifiers())
+                                && (n.toLowerCase().contains("time") || n.toLowerCase().contains("collect"))) {
+                            af.setAccessible(true);
+                            Object av = af.get(v);
+                            if (av instanceof Number || av instanceof Boolean) b.append(n).append('=').append(av).append(' ');
+                        }
+                    }
+                    b.append(") ");
+                } else if (withFieldNames) {
+                    b.append(f.getName()).append(':').append(v == null ? "null" : v.getClass().getSimpleName()).append(' ');
+                }
+            }
+        }
+        android.util.Log.i("CleancutTok", b.toString());
+    }
 }

@@ -84,6 +84,17 @@ private fun ClassDef.isSingleVideoOperator(operatorInterface: String): Boolean =
                 } == true
         }
 
+/**
+ * TikTok's success handler for a page of Favourites > Videos (getAllFavoritesContent, 30 at a
+ * time): an RxJava doOnNext that logs the call. Its strings: the endpoint and "net".
+ */
+internal object FavoritesPageFingerprint : Fingerprint(
+    name = "accept",
+    parameters = listOf("Ljava/lang/Object;"),
+    returnType = "V",
+    strings = listOf("/aweme/v1/aweme/listcollection/", "net"),
+)
+
 @Suppress("unused")
 val cleancutPatch = bytecodePatch(
     name = "CleancutTok",
@@ -131,6 +142,12 @@ val cleancutPatch = bytecodePatch(
                 return-object v0
             """,
             ExternalLabel("cleancut_keep_list", factory.getInstruction(0)),
+        )
+
+        // Favourites: each page as it arrives (diagnostics for oldest-first, for now).
+        FavoritesPageFingerprint.method.addInstruction(
+            0,
+            "invoke-static/range {p1 .. p1}, $EXTENSION->favoritesPage(Ljava/lang/Object;)V",
         )
 
         // Updates: a quiet check of this repository's latest release a few seconds after the
