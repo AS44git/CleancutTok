@@ -94,7 +94,11 @@ private fun ClassDef.isSingleVideoOperator(operatorInterface: String): Boolean =
 internal object ProfilePageFetchFingerprint : Fingerprint(
     accessFlags = listOf(AccessFlags.PUBLIC, AccessFlags.STATIC),
     returnType = "Lcom/ss/android/ugc/aweme/feed/model/FeedItemList;",
-    parameters = listOf("Z", "Ljava/lang/String;", "Ljava/lang/String;", "I", "J", "J", "I"),
+    parameters = listOf(
+        "Z", "Ljava/lang/String;", "Ljava/lang/String;", "I", "J", "J", "I", "Ljava/lang/String;",
+        "I", "I", "Ljava/lang/Integer;", "L", "Z", "Ljava/lang/String;", "Z", "Ljava/lang/String;",
+        "Ljava/lang/String;", "I", "Z", "Ljava/lang/String;",
+    ),
     strings = listOf("profile_aweme_post_refresh_count_setting"),
 )
 
