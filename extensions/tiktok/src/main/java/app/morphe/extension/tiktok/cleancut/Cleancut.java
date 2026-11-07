@@ -203,6 +203,7 @@ public final class Cleancut {
             }
             return;
         }
+        if (path != null && (path.contains("collect") || path.contains("favorite"))) noteFavoritesRequest(call, path);
         if (path == null || !blocks(path)) return;
         HookStatus.bound(FAMILY, "network gate");
         Logger.printDebug(() -> "[CleancutTok] blocked " + path);
@@ -330,13 +331,13 @@ public final class Cleancut {
                     }
                 }
             }
-            android.util.Log.i("CleancutTok", b.toString());
+            favLog(b.toString());
             if (items != null && !items.isEmpty()) {
                 describeItem("  first item", items.get(0), page == 1);
                 describeItem("  last item", items.get(items.size() - 1), false);
             }
         } catch (Throwable t) {
-            android.util.Log.w("CleancutTok", "favourites page: " + t);
+            favLog("favourites page: " + t);
         }
     }
 
@@ -367,6 +368,50 @@ public final class Cleancut {
                 }
             }
         }
-        android.util.Log.i("CleancutTok", b.toString());
+        favLog(b.toString());
+    }
+
+    /** Paging parameters only: nothing that names the account or the device. */
+    private static final java.util.Set<String> PAGING_KEYS = new java.util.HashSet<>(java.util.Arrays.asList(
+            "cursor", "max_cursor", "min_cursor", "count", "offset", "sort", "sort_type", "order",
+            "item_type", "type", "collect_type", "need_pin"));
+
+    private static void noteFavoritesRequest(Object call, String path) {
+        try {
+            Object request = requestField != null ? requestField.get(call) : null;
+            String url = request != null ? invokeString(request, "getUrl") : null;
+            StringBuilder b = new StringBuilder("request ").append(path);
+            if (url != null && url.indexOf('?') >= 0) {
+                for (String pair : url.substring(url.indexOf('?') + 1).split("&")) {
+                    int eq = pair.indexOf('=');
+                    String key = eq > 0 ? pair.substring(0, eq) : pair;
+                    if (PAGING_KEYS.contains(key)) b.append(' ').append(pair);
+                }
+            }
+            favLog(b.toString());
+        } catch (Throwable t) {
+            favLog("request " + path + " (" + t + ")");
+        }
+    }
+
+    /**
+     * TikTok silences the app's logcat output, so the diagnostics go to a file the app owns:
+     * Android/data/<package>/files/cleancut-favourites.txt (adb pull reads it).
+     */
+    private static synchronized void favLog(String line) {
+        try {
+            android.content.Context context = app.morphe.extension.shared.Utils.getContext();
+            if (context == null) return;
+            java.io.File dir = context.getExternalFilesDir(null);
+            if (dir == null) return;
+            try (java.io.FileWriter w = new java.io.FileWriter(new java.io.File(dir, "cleancut-favourites.txt"), true)) {
+                w.write(new java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(new java.util.Date()));
+                w.write(' ');
+                w.write(line);
+                w.write('\n');
+            }
+        } catch (Throwable ignored) {
+            // diagnostics only
+        }
     }
 }
