@@ -203,7 +203,7 @@ public final class Cleancut {
             }
             return;
         }
-        if (path != null && (path.contains("collect") || path.contains("favorite"))) noteFavoritesRequest(call, path);
+        if (path != null && noted(path)) noteFavoritesRequest(call, path);
         if (path == null || !blocks(path)) return;
         HookStatus.bound(FAMILY, "network gate");
         Logger.printDebug(() -> "[CleancutTok] blocked " + path);
@@ -344,5 +344,109 @@ public final class Cleancut {
         } catch (Throwable ignored) {
             // diagnostics only
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Diagnostics: the favourite sounds and effects lists come back empty while their counts
+    // say otherwise. Their replies are written to the notes file to see what the server sends.
+    // ---------------------------------------------------------------------------------------
+
+    static boolean noted(String path) {
+        return path.contains("collect") || path.contains("favorite") || path.contains("sticker")
+                || path.contains("effect") || path.contains("prop");
+    }
+
+    private static int repliesNoted;
+
+    /** Every parsed reply (via Follow diagnostics' hook); sound and effect lists are written down. */
+    public static void noteReply(Object request, Object response) {
+        try {
+            if (request == null || repliesNoted >= 12) return;
+            String url = invokeString(request, "getUrl");
+            if (url == null) url = invokeString(request, "getPath");
+            if (url == null) return;
+            int q = url.indexOf('?');
+            String path = q >= 0 ? url.substring(0, q) : url;
+            if (!(path.contains("music/collect") || path.contains("sticker") || path.contains("effect")
+                    || path.contains("prop/") || path.contains("collection"))) return;
+            if (path.contains("listcollection")) return;   // videos: already understood
+            repliesNoted++;
+            Object body = response;
+            try {
+                java.lang.reflect.Method m = response.getClass().getMethod("body");
+                body = m.invoke(response);
+            } catch (Throwable ignored) {
+                // not an SsResponse
+            }
+            StringBuilder b = new StringBuilder("reply ").append(path).append(" -> ");
+            dump(b, body, 0);
+            String text = b.length() > 30000 ? b.substring(0, 30000) + " …" : b.toString();
+            favLog(text);
+        } catch (Throwable t) {
+            favLog("reply: " + t);
+        }
+    }
+
+    private static void dump(StringBuilder b, Object o, int depth) {
+        if (o == null) { b.append("null"); return; }
+        if (o instanceof CharSequence) {
+            String s = o.toString();
+            b.append('"').append(s.length() > (depth == 0 ? 25000 : 160) ? s.substring(0, depth == 0 ? 25000 : 160) + "…" : s).append('"');
+            return;
+        }
+        if (o instanceof Number || o instanceof Boolean || o instanceof Character || o.getClass().isEnum()) {
+            b.append(o);
+            return;
+        }
+        if (depth >= 4) { b.append(o.getClass().getSimpleName()); return; }
+        if (o instanceof java.util.Collection) {
+            java.util.Collection<?> c = (java.util.Collection<?>) o;
+            b.append('[').append(c.size()).append(": ");
+            int n = 0;
+            for (Object e : c) {
+                if (n++ >= 3) { b.append(" …"); break; }
+                dump(b, e, depth + 1);
+                b.append(", ");
+            }
+            b.append(']');
+            return;
+        }
+        if (o instanceof java.util.Map) {
+            java.util.Map<?, ?> m = (java.util.Map<?, ?>) o;
+            b.append('{');
+            int n = 0;
+            for (java.util.Map.Entry<?, ?> e : m.entrySet()) {
+                if (n++ >= 40) { b.append(" …"); break; }
+                b.append(e.getKey()).append('=');
+                dump(b, e.getValue(), depth + 1);
+                b.append(", ");
+            }
+            b.append('}');
+            return;
+        }
+        if (o.getClass().getName().startsWith("com.google.gson") || o.getClass().getName().contains("Json")) {
+            String s = o.toString();
+            b.append(s.length() > 25000 ? s.substring(0, 25000) + "…" : s);
+            return;
+        }
+        b.append(o.getClass().getName()).append('{');
+        int fields = 0;
+        for (Class<?> c = o.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                if (fields++ >= 60) break;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(o);
+                    if (v == null) continue;
+                    b.append(f.getName()).append('=');
+                    dump(b, v, depth + 1);
+                    b.append(", ");
+                } catch (Throwable ignored) {
+                    // skip
+                }
+            }
+        }
+        b.append('}');
     }
 }

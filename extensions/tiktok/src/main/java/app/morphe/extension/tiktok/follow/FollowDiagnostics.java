@@ -295,6 +295,7 @@ public final class FollowDiagnostics {
     }
 
     public static void logParsedResponse(Object request, Object response) {
+        app.morphe.extension.tiktok.cleancut.Cleancut.noteReply(request, response);
         String followPath = followPath(request);
         if (followPath != null) {
             final String finalPath = followPath;
