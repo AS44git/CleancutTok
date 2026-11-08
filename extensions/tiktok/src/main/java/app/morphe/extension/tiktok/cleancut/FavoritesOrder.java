@@ -53,7 +53,7 @@ public final class FavoritesOrder {
 
     public static boolean oldestFirst() {
         SharedPreferences p = prefs();
-        return p != null && p.getBoolean("oldest_first", true);
+        return p != null && p.getBoolean("oldest_first", false);
     }
 
     public static void setOldestFirst(boolean on) {

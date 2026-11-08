@@ -12,12 +12,9 @@ import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.widget.TextView;
 
-import org.json.JSONArray;
-import org.json.JSONObject;
 
 import java.lang.reflect.Method;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.Set;
 import java.util.WeakHashMap;
 
@@ -96,69 +93,6 @@ public final class FavoritesTabs {
         Utils.showToastLong(oldest
                 ? "Favourites: oldest first. Open Favourites again to see it."
                 : "Favourites: newest first. Open Favourites again to see it.");
-    }
-
-    // --- Sounds and Effects: read-only probe ------------------------------------------------
-
-    private static volatile boolean probing;
-
-    private static void probe(String kind) {
-        if (probing) return;
-        probing = true;
-        Utils.showToastShort("Checking favourite " + kind + "…");
-        Thread t = new Thread(() -> {
-            try {
-                StringBuilder summary = new StringBuilder("Favourite " + kind + ":");
-                String uid = app.morphe.extension.tiktok.SignedInUser.id();
-                String[] variants = kind.equals("sounds")
-                        ? new String[] {
-                            "/aweme/v1/user/music/collect/?count=50&cursor=0",
-                            "/aweme/v1/user/music/collect/?count=50&cursor=0&enable_offline_similar_music=1",
-                            "/aweme/v1/user/music/collect/?count=50&cursor=0&enable_offline_similar_music=1&biz=music_collection",
-                            "/aweme/v1/user/music/collect/?count=50&cursor=0&enable_offline_similar_music=1&biz=music_collection&scene=favorite",
-                            "/aweme/v1/user/music/collect/?count=50&cursor=0&enable_offline_similar_music=1&biz=music_collection&scene=profile",
-                            "/aweme/v1/user/music/collect/other/?count=50&cursor=0&to_uid=" + uid,
-                            "/aweme/v1/user/music/collect/other/?count=50&cursor=0&enable_offline_similar_music=1&to_uid=" + uid,
-                            "/aweme/v1/music/collection/empty/item/",
-                            "/aweme/v1/music/collection/count/",
-                        }
-                        : new String[] {
-                            "/aweme/v1/sticker/listcollection/?count=50&cursor=0",
-                        };
-                for (int i = 0; i < variants.length; i++) {
-                    String raw;
-                    try {
-                        raw = get(HOST + variants[i]);
-                    } catch (Exception e) {
-                        raw = "ERROR " + e;
-                    }
-                    Cleancut.favLog("RAW " + kind + " variant " + i + " " + variants[i] + " -> "
-                            + (raw == null ? "null" : raw.length() > 60000 ? raw.substring(0, 60000) + " …" : raw));
-                    int n = -1;
-                    try { n = longestList(new JSONObject(raw)); } catch (Throwable ignored) { }
-                    summary.append(' ').append(i).append('=').append(n);
-                }
-                Cleancut.favLog(summary.toString());
-                Utils.showToastLong(summary + " (saved to the notes file)");
-            } catch (Throwable e) {
-                Cleancut.favLog("probe " + kind + ": " + e);
-                Utils.showToastLong("Couldn't check favourite " + kind + ": " + e.getMessage());
-            } finally {
-                probing = false;
-            }
-        }, "cleancut-probe");
-        t.setDaemon(true);
-        t.start();
-    }
-
-    /** The biggest list in the reply, as a count of items (the list's key varies by endpoint). */
-    private static int longestList(JSONObject json) {
-        int best = 0;
-        for (Iterator<String> it = json.keys(); it.hasNext(); ) {
-            Object v = json.opt(it.next());
-            if (v instanceof JSONArray) best = Math.max(best, ((JSONArray) v).length());
-        }
-        return best;
     }
 
     /** A GET through TikTok's own network stack (common parameters and signing included). */
