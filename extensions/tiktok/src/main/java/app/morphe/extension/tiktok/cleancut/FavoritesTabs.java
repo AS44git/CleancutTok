@@ -109,28 +109,38 @@ public final class FavoritesTabs {
         Utils.showToastShort("Checking favourite " + kind + "…");
         Thread t = new Thread(() -> {
             try {
-                String path = kind.equals("sounds")
-                        ? "/aweme/v1/user/music/collect/?count=50&cursor="
-                        : "/aweme/v1/sticker/listcollection/?count=50&cursor=";
-                long cursor = 0;
-                int items = 0;
-                int pages = 0;
-                for (; pages < 6; pages++) {
-                    String raw = get(HOST + path + cursor);
-                    Cleancut.favLog("RAW " + kind + " page " + pages + " (cursor " + cursor + "): "
+                StringBuilder summary = new StringBuilder("Favourite " + kind + ":");
+                String uid = app.morphe.extension.tiktok.SignedInUser.id();
+                String[] variants = kind.equals("sounds")
+                        ? new String[] {
+                            "/aweme/v1/user/music/collect/?count=50&cursor=0",
+                            "/aweme/v1/user/music/collect/?count=50&cursor=0&enable_offline_similar_music=1",
+                            "/aweme/v1/user/music/collect/?count=50&cursor=0&enable_offline_similar_music=1&biz=music_collection",
+                            "/aweme/v1/user/music/collect/?count=50&cursor=0&enable_offline_similar_music=1&biz=music_collection&scene=favorite",
+                            "/aweme/v1/user/music/collect/?count=50&cursor=0&enable_offline_similar_music=1&biz=music_collection&scene=profile",
+                            "/aweme/v1/user/music/collect/other/?count=50&cursor=0&to_uid=" + uid,
+                            "/aweme/v1/user/music/collect/other/?count=50&cursor=0&enable_offline_similar_music=1&to_uid=" + uid,
+                            "/aweme/v1/music/collection/empty/item/",
+                            "/aweme/v1/music/collection/count/",
+                        }
+                        : new String[] {
+                            "/aweme/v1/sticker/listcollection/?count=50&cursor=0",
+                        };
+                for (int i = 0; i < variants.length; i++) {
+                    String raw;
+                    try {
+                        raw = get(HOST + variants[i]);
+                    } catch (Exception e) {
+                        raw = "ERROR " + e;
+                    }
+                    Cleancut.favLog("RAW " + kind + " variant " + i + " " + variants[i] + " -> "
                             + (raw == null ? "null" : raw.length() > 60000 ? raw.substring(0, 60000) + " …" : raw));
-                    if (raw == null) break;
-                    JSONObject json = new JSONObject(raw);
-                    items += longestList(json);
-                    boolean more = json.optInt("has_more", json.optBoolean("has_more") ? 1 : 0) == 1;
-                    long next = json.optLong("cursor", json.optLong("max_cursor", 0));
-                    if (!more || next == cursor) { pages++; break; }
-                    cursor = next;
+                    int n = -1;
+                    try { n = longestList(new JSONObject(raw)); } catch (Throwable ignored) { }
+                    summary.append(' ').append(i).append('=').append(n);
                 }
-                String summary = "Favourite " + kind + ": the server listed " + items + " over " + pages
-                        + " page(s). Saved to the notes file.";
-                Cleancut.favLog(summary);
-                Utils.showToastLong(summary);
+                Cleancut.favLog(summary.toString());
+                Utils.showToastLong(summary + " (saved to the notes file)");
             } catch (Throwable e) {
                 Cleancut.favLog("probe " + kind + ": " + e);
                 Utils.showToastLong("Couldn't check favourite " + kind + ": " + e.getMessage());
