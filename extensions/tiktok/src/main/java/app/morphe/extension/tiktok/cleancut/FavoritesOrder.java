@@ -14,6 +14,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Set;
 
 import app.morphe.extension.shared.Utils;
@@ -66,8 +68,12 @@ public final class FavoritesOrder {
     /** Set while this thread walks or serves (its own calls go through untouched). */
     private static final ThreadLocal<Boolean> INSIDE = ThreadLocal.withInitial(() -> false);
 
-    /** The served session: videos already shown, so a page seam never shows one twice. */
-    private static final Set<String> SHOWN = Collections.synchronizedSet(new HashSet<>());
+    /**
+     * The videos on each served page, by page number, so a video at a page seam shows once:
+     * page j drops only what page j-1 already showed. (Not a running set: TikTok can ask for
+     * the first page twice at once, and the second must not come back empty.)
+     */
+    private static final Map<Integer, Set<String>> SERVED = new ConcurrentHashMap<>();
 
     /** The class holding the fetch method, so the walk can call it. */
     public static void fetcherClass(Class<?> type) {
@@ -102,7 +108,6 @@ public final class FavoritesOrder {
             if (cursor < 0 || cursor >= MAX_TOKEN) return null;  // a real save time: not ours
             String owner = (a2 != null && !a2.isEmpty()) ? a2 : (a1 != null && !a1.isEmpty() ? a1 : "me");
             if (cursor == 0) {
-                SHOWN.clear();
                 pages = Index.ready(owner, args);
             } else {
                 pages = Index.kept(owner);
@@ -118,14 +123,25 @@ public final class FavoritesOrder {
         if (result == null) return null;
         try {
             List<?> items = (List<?>) invoke(result, "getItems");
-            List<Object> out = new ArrayList<>();
-            if (items != null) {
-                for (int i = items.size() - 1; i >= 0; i--) {
-                    Object aweme = items.get(i);
-                    String id = aweme == null ? null : (String) invoke(aweme, "getAid");
-                    if (id == null || SHOWN.add(id)) out.add(aweme);
-                }
+            if (items == null || items.isEmpty() || statusCode(result) != 0) {
+                Cleancut.favLog("favourites page " + page + " came back empty (status " + statusCode(result) + ")");
+                // First page: TikTok's own (newest-first) list rather than an empty screen.
+                return page == 0 ? null : result;
             }
+            Set<String> before = page == 0 ? Collections.emptySet() : SERVED.get(page - 1);
+            Set<String> ids = new HashSet<>();
+            List<Object> out = new ArrayList<>();
+            for (int i = items.size() - 1; i >= 0; i--) {
+                Object aweme = items.get(i);
+                String id = aweme == null ? null : (String) invoke(aweme, "getAid");
+                if (id != null) ids.add(id);
+                if (id == null || before == null || !before.contains(id)) out.add(aweme);
+            }
+            if (out.isEmpty()) {                            // never an empty page
+                for (int i = items.size() - 1; i >= 0; i--) out.add(items.get(i));
+            }
+            if (page == 0) SERVED.clear();
+            SERVED.put(page, ids);
             invoke(result, "setItems", List.class, out);
             int next = page + 1;
             boolean more = next < pages.size();
@@ -191,12 +207,12 @@ public final class FavoritesOrder {
             if (pages.isEmpty()) pages.add(0L);
             long cursor = pages.get(pages.size() - 1);
             int failures = 0;
-            Utils.showToastShort("Sorting your favourites oldest first… (once)");
+            Utils.showToastLong("Sorting your favourites oldest first. This takes a few minutes, once.");
             while (true) {
                 Object page = fetch(args, cursor);
-                if (page == null) {
+                if (page == null || statusCode(page) != 0 || itemCount(page) == 0 && hasMore(page)) {
                     if (++failures >= 3) { save(owner); return; }   // try again next opening
-                    sleep(1000);
+                    sleep(3000);
                     continue;
                 }
                 failures = 0;
@@ -213,7 +229,7 @@ public final class FavoritesOrder {
                     save(owner);
                     Utils.showToastShort("Sorting favourites… about " + (pages.size() * PAGE) + " so far");
                 }
-                sleep(120);
+                sleep(700);    // about the pace of someone scrolling, not a burst
             }
         }
 
@@ -231,9 +247,11 @@ public final class FavoritesOrder {
             long cursor = 0;
             for (int i = 0; i < 60; i++) {
                 Object page = fetch(args, cursor);
-                if (page == null) return;    // keep what we have
+                // A failed or empty reply never replaces what's kept.
+                if (page == null || statusCode(page) != 0 || itemCount(page) == 0) return;
                 long next = nextCursor(page);
                 if (!hasMore(page) || next <= 0) {
+                    if (pages.size() > top.size() + 2) return;   // implausible: keep what we have
                     pages = top;              // everything fits in these pages
                     save(owner);
                     return;
@@ -241,7 +259,7 @@ public final class FavoritesOrder {
                 top.add(next);
                 if (next <= keptTop) break;
                 cursor = next;
-                sleep(120);
+                sleep(700);
             }
             long last = top.get(top.size() - 1);
             for (int i = 1; i < pages.size(); i++) {
@@ -285,6 +303,31 @@ public final class FavoritesOrder {
             long c = (Long) invoke(page, "getCursor");
             if (c > 0) return c;
             return (Long) invoke(page, "getMaxCursor");
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /** TikTok's status_code on a reply (0 is fine); -1 if it can't be read. */
+    private static int statusCode(Object page) {
+        for (Class<?> c = page.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField("status_code");
+                f.setAccessible(true);
+                return f.getInt(page);
+            } catch (NoSuchFieldException ignored) {
+                // up a class
+            } catch (Throwable t) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+
+    private static int itemCount(Object page) {
+        try {
+            List<?> items = (List<?>) invoke(page, "getItems");
+            return items == null ? 0 : items.size();
         } catch (Throwable t) {
             return 0;
         }
