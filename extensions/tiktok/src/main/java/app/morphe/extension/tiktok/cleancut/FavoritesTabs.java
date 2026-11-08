@@ -25,9 +25,8 @@ import app.morphe.extension.shared.Utils;
 
 /**
  * Long-presses on the Favourites row ("Posts 4531 | Collections 0 | Sounds 53 | Effects 1"):
- * Posts switches newest/oldest first; Sounds and Effects (for now) fetch their lists straight
- * from TikTok's API and write what comes back to the notes file, to see how unavailable ones
- * are sent before anything is removed.
+ * Posts switches newest/oldest first; Sounds and Effects find the unavailable ones TikTok
+ * counts but never shows, and remove them once confirmed ({@link FavoritesCleanup}).
  *
  * <p>The row's tabs are found by their text when Favourites asks for a page, so nothing here
  * depends on TikTok's class names. Requests go through TikTok's own NetworkUtils.executeGet,
@@ -81,7 +80,7 @@ public final class FavoritesTabs {
         tab.setOnLongClickListener(v -> {
             try {
                 if (k.equals("posts")) switchOrder(v);
-                else probe(k);
+                else FavoritesCleanup.start(k);
             } catch (Throwable t) {
                 Cleancut.favLog("favourites long-press: " + t);
             }
