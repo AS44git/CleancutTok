@@ -100,6 +100,7 @@ public final class FavoritesOrder {
                                String a13, boolean a14, String a15, String a16, int a17, boolean a18,
                                String a19) throws Throwable {
         if (type != FAVORITES || INSIDE.get() || fetcher == null) return null;
+        FavoritesTabs.attachSoon();
         List<Long> pages;
         Object[] args = {a0, a1, a2, type, minCursor, cursor, count, a7, a8, a9, a10, a11, a12,
                 a13, a14, a15, a16, a17, a18, a19};
@@ -107,28 +108,31 @@ public final class FavoritesOrder {
             if (!oldestFirst()) return null;
             if (cursor < 0 || cursor >= MAX_TOKEN) return null;  // a real save time: not ours
             String owner = (a2 != null && !a2.isEmpty()) ? a2 : (a1 != null && !a1.isEmpty() ? a1 : "me");
-            if (cursor == 0) {
-                pages = Index.ready(owner, args);
-            } else {
-                pages = Index.kept(owner);
-            }
+            // Never waits: the walk (first time) or the top check (after) runs on its own thread,
+            // and until the walk is done TikTok's own order shows.
+            pages = cursor == 0 ? Index.opened(owner, args) : Index.kept(owner);
         } catch (Throwable t) {
             Cleancut.favLog("favourites order: " + t);
             return null;
         }
-        if (pages == null || pages.isEmpty()) return null;       // no index: TikTok's own order
+        if (pages == null || pages.isEmpty()) return null;       // no index yet: TikTok's own order
         int page = (int) cursor;
         if (page >= pages.size()) return null;
-        Object result = Index.fetchOrThrow(args, pages.get(pages.size() - 1 - page));
-        if (result == null) return null;
+        // A stretch of unavailable videos comes back as an empty page: skip on to the next.
+        Object result = null;
+        List<?> items = null;
+        for (int tries = 0; tries < 6 && page < pages.size(); tries++, page++) {
+            result = Index.fetchOrThrow(args, pages.get(pages.size() - 1 - page));
+            if (result == null || statusCode(result) != 0) break;
+            items = (List<?>) invoke(result, "getItems");
+            if (items != null && !items.isEmpty()) break;
+        }
+        if (result == null || items == null || items.isEmpty() || statusCode(result) != 0) {
+            Cleancut.favLog("favourites page " + cursor + " came back empty");
+            return cursor == 0 ? null : result;   // first page: TikTok's own list, not a blank
+        }
         try {
-            List<?> items = (List<?>) invoke(result, "getItems");
-            if (items == null || items.isEmpty() || statusCode(result) != 0) {
-                Cleancut.favLog("favourites page " + page + " came back empty (status " + statusCode(result) + ")");
-                // First page: TikTok's own (newest-first) list rather than an empty screen.
-                return page == 0 ? null : result;
-            }
-            Set<String> before = page == 0 ? Collections.emptySet() : SERVED.get(page - 1);
+            Set<String> before = cursor == 0 ? Collections.emptySet() : SERVED.get(page - 1);
             Set<String> ids = new HashSet<>();
             List<Object> out = new ArrayList<>();
             for (int i = items.size() - 1; i >= 0; i--) {
@@ -140,7 +144,7 @@ public final class FavoritesOrder {
             if (out.isEmpty()) {                            // never an empty page
                 for (int i = items.size() - 1; i >= 0; i--) out.add(items.get(i));
             }
-            if (page == 0) SERVED.clear();
+            if (cursor == 0) SERVED.clear();
             SERVED.put(page, ids);
             invoke(result, "setItems", List.class, out);
             int next = page + 1;
@@ -158,21 +162,47 @@ public final class FavoritesOrder {
 
     /** The cursors each page starts at, newest page first (the first is 0), kept on the phone. */
     private static final class Index {
-        private static List<Long> pages;
+        private static volatile List<Long> pages;
         private static String pagesOwner;
-        private static boolean complete;
+        private static volatile boolean complete;
+
+        private static volatile boolean busy;
 
         static synchronized List<Long> kept(String owner) {
-            load(owner);
+            if (!busy) load(owner);
             return complete ? pages : null;
         }
 
-        /** Walks what isn't known yet (all of it the first time, the top after that). */
-        static synchronized List<Long> ready(String owner, Object[] args) {
-            load(owner);
-            if (!complete) walkAll(owner, args);
-            else refreshTop(owner, args);
-            return complete ? pages : null;
+        /**
+         * Favourites opened: the kept pages as they stand, and in the background either the
+         * walk (not done yet) or a check of the top for new favourites (shown next opening).
+         */
+        static List<Long> opened(String owner, Object[] args) {
+            List<Long> now;
+            boolean walk;
+            synchronized (Index.class) {
+                if (!busy) load(owner);
+                now = complete ? pages : null;
+                walk = !complete;
+                if (busy) return now;
+                busy = true;
+            }
+            Thread t = new Thread(() -> {
+                // Not under the lock: the walk takes minutes and openings must never wait on it.
+                // Only this thread changes the pages (busy), and they're served only once
+                // complete; the top check swaps in a whole new list in one assignment.
+                try {
+                    if (walk) walkAll(owner, args);
+                    else refreshTop(owner, args);
+                } catch (Throwable e) {
+                    Cleancut.favLog("favourites background: " + e);
+                } finally {
+                    busy = false;
+                }
+            }, "cleancut-favourites");
+            t.setDaemon(true);
+            t.start();
+            return now;
         }
 
         private static void load(String owner) {
@@ -207,29 +237,36 @@ public final class FavoritesOrder {
             if (pages.isEmpty()) pages.add(0L);
             long cursor = pages.get(pages.size() - 1);
             int failures = 0;
-            Utils.showToastLong("Sorting your favourites oldest first. This takes a few minutes, once.");
+            Utils.showToastLong(pages.size() > 1
+                    ? "Still sorting your favourites oldest first, carrying on in the background."
+                    : "Sorting your favourites oldest first in the background (about 10 minutes, once). "
+                        + "Newest first until then.");
             while (true) {
                 Object page = fetch(args, cursor);
-                if (page == null || statusCode(page) != 0 || itemCount(page) == 0 && hasMore(page)) {
-                    if (++failures >= 3) { save(owner); return; }   // try again next opening
+                long next = page == null ? 0 : nextCursor(page);
+                boolean more = page != null && hasMore(page);
+                // A failure is no reply, an error, or a cursor that doesn't move on. An empty page
+                // that moves on is a stretch of unavailable videos, and fine.
+                if (page == null || statusCode(page) != 0 || more && (next <= 0 || cursor != 0 && next >= cursor)) {
+                    if (++failures >= 3) { save(owner); return; }   // carry on next opening
                     sleep(3000);
                     continue;
                 }
                 failures = 0;
-                long next = nextCursor(page);
-                if (!hasMore(page) || next <= 0 || next >= cursor && cursor != 0) {
+                if (!more) {
                     complete = true;
                     save(owner);
                     Cleancut.favLog("favourites indexed: " + pages.size() + " pages");
+                    Utils.showToastLong("Favourites are sorted oldest first. Open Favourites again to see them.");
                     return;
                 }
                 pages.add(next);
                 cursor = next;
-                if (pages.size() % 20 == 0) {
-                    save(owner);
-                    Utils.showToastShort("Sorting favourites… about " + (pages.size() * PAGE) + " so far");
+                if (pages.size() % 10 == 0) save(owner);
+                if (pages.size() % 30 == 0) {
+                    Utils.showToastShort("Sorting favourites oldest first… about " + (pages.size() * PAGE) + " done");
                 }
-                sleep(700);    // about the pace of someone scrolling, not a burst
+                sleep(150);
             }
         }
 
@@ -259,7 +296,7 @@ public final class FavoritesOrder {
                 top.add(next);
                 if (next <= keptTop) break;
                 cursor = next;
-                sleep(700);
+                sleep(150);
             }
             long last = top.get(top.size() - 1);
             for (int i = 1; i < pages.size(); i++) {
