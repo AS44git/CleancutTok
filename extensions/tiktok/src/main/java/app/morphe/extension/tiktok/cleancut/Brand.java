@@ -26,5 +26,5 @@ public final class Brand {
      * released under the tag v47-6-3-1. Bump it for every release, so a fix on the same TikTok
      * version is still offered as an update. The release workflow reads it from here.
      */
-    public static final int REVISION = 1;
+    public static final int REVISION = 2;
 }

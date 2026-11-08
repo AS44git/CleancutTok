@@ -300,4 +300,29 @@ public final class Cleancut {
     private static String asString(Object value) {
         return value == null ? null : value.toString();
     }
+
+    /**
+     * Short notes when something in the favourites features goes wrong. TikTok silences the
+     * app's logcat output, so they go to a file the app owns, kept small:
+     * Android/data/<package>/files/cleancut-favourites.txt (adb pull reads it).
+     */
+    static synchronized void favLog(String line) {
+        try {
+            android.content.Context context = app.morphe.extension.shared.Utils.getContext();
+            if (context == null) return;
+            java.io.File dir = context.getExternalFilesDir(null);
+            if (dir == null) return;
+            java.io.File file = new java.io.File(dir, "cleancut-favourites.txt");
+            if (file.length() > 256 * 1024) file.delete();
+            try (java.io.FileWriter w = new java.io.FileWriter(file, true)) {
+                w.write(new java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(new java.util.Date()));
+                w.write(' ');
+                w.write(line);
+                w.write('\n');
+            }
+        } catch (Throwable ignored) {
+            // diagnostics only
+        }
+    }
+
 }

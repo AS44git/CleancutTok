@@ -32,6 +32,7 @@ import com.android.tools.smali.dexlib2.iface.reference.TypeReference
 import org.w3c.dom.Element
 
 private const val EXTENSION = "Lapp/morphe/extension/tiktok/cleancut/Cleancut;"
+private const val FAVORITES = "Lapp/morphe/extension/tiktok/cleancut/FavoritesOrder;"
 private const val UPDATER = "Lapp/morphe/extension/tiktok/cleancut/Updater;"
 private const val INSTALL_PERMISSION = "android.permission.REQUEST_INSTALL_PACKAGES"
 
@@ -84,6 +85,23 @@ private fun ClassDef.isSingleVideoOperator(operatorInterface: String): Boolean =
                 } == true
         }
 
+/**
+ * The one method that fetches a page for every profile tab (posts, liked, favourites...):
+ * static, twenty arguments, the fourth the tab type (4 is favourites), then the min cursor, the
+ * cursor and the page size; returns TikTok's FeedItemList. X.0AEo.LJII in 47.6.3. It reads
+ * "profile_aweme_post_refresh_count_setting" for its posts refresh count.
+ */
+internal object ProfilePageFetchFingerprint : Fingerprint(
+    accessFlags = listOf(AccessFlags.PUBLIC, AccessFlags.STATIC),
+    returnType = "Lcom/ss/android/ugc/aweme/feed/model/FeedItemList;",
+    parameters = listOf(
+        "Z", "Ljava/lang/String;", "Ljava/lang/String;", "I", "J", "J", "I", "Ljava/lang/String;",
+        "I", "I", "Ljava/lang/Integer;", "L", "Z", "Ljava/lang/String;", "Z", "Ljava/lang/String;",
+        "Ljava/lang/String;", "I", "Z", "Ljava/lang/String;",
+    ),
+    strings = listOf("profile_aweme_post_refresh_count_setting"),
+)
+
 @Suppress("unused")
 val cleancutPatch = bytecodePatch(
     name = "CleancutTok",
@@ -131,6 +149,28 @@ val cleancutPatch = bytecodePatch(
                 return-object v0
             """,
             ExternalLabel("cleancut_keep_list", factory.getInstruction(0)),
+        )
+
+        // Favourites oldest first: at the start of the profile page fetch, a favourites page in
+        // the oldest-first order is fetched and returned by the extension (null: carry on).
+        val fetch = ProfilePageFetchFingerprint.method
+        if (fetch.parameterTypes.size != 20) {
+            throw PatchException("CleancutTok: the profile page fetch now takes ${fetch.parameterTypes.size} arguments, not 20")
+        }
+        // v0 is free at the top of the method; the arguments are p0..p21 (two longs).
+        fetch.requireLocals("CleancutTok", 1)
+        fetch.addInstructionsWithLabels(
+            0,
+            """
+                const-class v0, ${fetch.definingClass}
+                invoke-static {v0}, $FAVORITES->fetcherClass(Ljava/lang/Class;)V
+                invoke-static/range {p0 .. p21}, $FAVORITES->enter(ZLjava/lang/String;Ljava/lang/String;IJJILjava/lang/String;IILjava/lang/Integer;Ljava/lang/Object;ZLjava/lang/String;ZLjava/lang/String;Ljava/lang/String;IZLjava/lang/String;)Ljava/lang/Object;
+                move-result-object v0
+                if-eqz v0, :cleancut_tiktok_fetch
+                check-cast v0, ${fetch.returnType}
+                return-object v0
+            """,
+            ExternalLabel("cleancut_tiktok_fetch", fetch.getInstruction(0)),
         )
 
         // Updates: a quiet check of this repository's latest release a few seconds after the
