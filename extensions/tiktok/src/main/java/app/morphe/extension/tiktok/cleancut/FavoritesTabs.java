@@ -76,7 +76,7 @@ public final class FavoritesTabs {
         final String k = kind;
         tab.setOnLongClickListener(v -> {
             try {
-                if (k.equals("posts")) switchOrder(v);
+                if (k.equals("posts")) FavoritesTools.menu();
                 else FavoritesCleanup.start(k);
             } catch (Throwable t) {
                 Cleancut.favLog("favourites long-press: " + t);
