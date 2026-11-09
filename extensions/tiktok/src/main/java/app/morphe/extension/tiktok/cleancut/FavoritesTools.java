@@ -131,26 +131,21 @@ public final class FavoritesTools {
         List<String> out = new ArrayList<>();
         long cursor = before;
         for (int page = 0; page < 500; page++) {
-            JSONObject json = list(cursor, 30);
-            List<String> ids = ids(json);
-            long next = json.optLong("cursor", json.optLong("max_cursor", 0));
-            boolean more = json.optInt("has_more", 0) == 1;
-            if (next >= notBefore || notBefore == 0) {
-                out.addAll(ids);
-                if (!more || next <= 0 || next >= cursor) break;
-                cursor = next;
+            FavoritesOrder.Page p = page(cursor, 30);
+            if (p.next >= notBefore || notBefore == 0) {
+                out.addAll(p.ids);
+                if (!p.more || p.next <= 0 || p.next >= cursor) break;
+                cursor = p.next;
             } else {
                 // This page crosses the start: one video at a time (each reply's cursor is that
                 // video's save time) until the save times go past it.
                 long c = cursor;
                 for (int i = 0; i < 40; i++) {
-                    JSONObject one = list(c, 1);
-                    List<String> got = ids(one);
-                    long t = one.optLong("cursor", one.optLong("max_cursor", 0));
-                    if (t < notBefore) break;
-                    out.addAll(got);
-                    if (one.optInt("has_more", 0) != 1 || t <= 0 || t >= c) break;
-                    c = t;
+                    FavoritesOrder.Page one = page(c, 1);
+                    if (one.next < notBefore) break;
+                    out.addAll(one.ids);
+                    if (!one.more || one.next <= 0 || one.next >= c) break;
+                    c = one.next;
                 }
                 break;
             }
@@ -164,7 +159,7 @@ public final class FavoritesTools {
         int now = Calendar.getInstance().get(Calendar.YEAR);
         int first = -1;
         for (int y = 2014; y <= now; y++) {
-            if (!ids(list(startOfYear(y + 1), 1)).isEmpty()) { first = y; break; }
+            if (!page(startOfYear(y + 1), 1).ids.isEmpty()) { first = y; break; }
         }
         List<String> out = new ArrayList<>();
         if (first < 0) return out;
@@ -176,10 +171,21 @@ public final class FavoritesTools {
         return out.size() > n ? new ArrayList<>(out.subList(0, n)) : out;
     }
 
-    private static JSONObject list(long cursor, int count) throws Exception {
-        JSONObject json = new JSONObject(get(HOST + "/aweme/v1/aweme/listcollection/?count=" + count + "&cursor=" + cursor));
-        if (json.optInt("status_code", 0) != 0) throw new Exception("TikTok said " + json.optString("status_msg", "status " + json.optInt("status_code")));
-        return json;
+    private static String ownUid, ownSecUid;
+
+    /**
+     * A page of your favourites through TikTok's own Favourites request (the one it makes when
+     * you scroll the tab), at a gentle pace.
+     */
+    private static FavoritesOrder.Page page(long cursor, int count) throws Exception {
+        if (ownUid == null) {
+            JSONObject user = new JSONObject(get(HOST + "/aweme/v1/user/profile/self/")).optJSONObject("user");
+            ownUid = user == null ? "" : user.optString("uid", "");
+            ownSecUid = user == null ? "" : user.optString("sec_uid", "");
+        }
+        FavoritesOrder.Page p = FavoritesOrder.page(cursor, count, ownUid, ownSecUid);
+        sleep(250);
+        return p;
     }
 
     private static List<String> ids(JSONObject json) {
@@ -222,14 +228,27 @@ public final class FavoritesTools {
         int total = left.size();
         int removed = 0;
         int refusals = 0;
+        boolean usePost = false, triedPost = false;
         Utils.showToastLong("Removing " + fmt(total) + " favourites, oldest first…");
         while (!left.isEmpty()) {
             String id = left.get(0);
             String why;
             try {
-                JSONObject r = new JSONObject(get(HOST + "/aweme/v1/aweme/collect/?action=0&aweme_id=" + id));
+                String url = HOST + "/aweme/v1/aweme/collect/?action=0&aweme_id=" + id;
+                String raw = usePost ? post(url) : get(url);
+                JSONObject r = new JSONObject(raw);
                 int code = r.optInt("status_code", -1);
-                why = code == 0 ? null : r.optString("status_msg", "status " + code);
+                if (code != 0 && !usePost && !triedPost) {
+                    // Some TikTok versions want this one as a POST: try that once, keep what works.
+                    triedPost = true;
+                    Cleancut.favLog("unfavourite GET " + id + ": " + raw);
+                    String raw2 = post(url);
+                    JSONObject r2 = new JSONObject(raw2);
+                    Cleancut.favLog("unfavourite POST " + id + ": " + raw2);
+                    if (r2.optInt("status_code", -1) == 0) { usePost = true; r = r2; code = 0; }
+                }
+                String msg = r.optString("status_msg", "");
+                why = code == 0 ? null : (msg.isEmpty() ? "status " + code : msg);
             } catch (Throwable t) {
                 why = String.valueOf(t.getMessage());
             }

@@ -104,6 +104,7 @@ public final class FavoritesOrder {
         List<Long> pages;
         Object[] args = {a0, a1, a2, type, minCursor, cursor, count, a7, a8, a9, a10, a11, a12,
                 a13, a14, a15, a16, a17, a18, a19};
+        lastArgs = args;
         try {
             if (!oldestFirst()) return null;
             if (cursor < 0 || cursor >= MAX_TOKEN) return null;  // a real save time: not ours
@@ -156,6 +157,69 @@ public final class FavoritesOrder {
             Cleancut.favLog("favourites order (page): " + t);
         }
         return result;
+    }
+
+    // --- one page, for the tools ---------------------------------------------------------------
+
+    /** The arguments of the last Favourites page TikTok asked for (whose list, and how). */
+    private static volatile Object[] lastArgs;
+    private static volatile Object[] ownArgs;
+
+    /** A page of favourites: ids newest first, the cursor after it (a save time), and if there's more. */
+    static final class Page {
+        final List<String> ids;
+        final long next;
+        final boolean more;
+
+        Page(List<String> ids, long next, boolean more) {
+            this.ids = ids;
+            this.next = next;
+            this.more = more;
+        }
+    }
+
+    /**
+     * Your favourites saved before {@code cursor} (a save time in seconds), newest first, through
+     * TikTok's own request for the Favourites tab: the same one the app makes when you scroll it.
+     * Only ever your own list: the arguments are checked against your own profile once.
+     */
+    static Page page(long cursor, int count, String ownUid, String ownSecUid) throws Exception {
+        Object[] args = ownArgs;
+        if (args == null) {
+            Object[] seen = lastArgs;
+            if (seen == null || fetcher == null) {
+                throw new Exception("open your own Favourites tab first (scroll it a little), then try again");
+            }
+            String a1 = seen[1] == null ? "" : String.valueOf(seen[1]);
+            String a2 = seen[2] == null ? "" : String.valueOf(seen[2]);
+            boolean mine = (ownUid != null && !ownUid.isEmpty() && (ownUid.equals(a1) || ownUid.equals(a2)))
+                    || (ownSecUid != null && !ownSecUid.isEmpty() && (ownSecUid.equals(a1) || ownSecUid.equals(a2)))
+                    || (a1.isEmpty() && a2.isEmpty());
+            if (!mine) throw new Exception("open your own Favourites tab (not someone else's), then try again");
+            ownArgs = args = seen;
+        }
+        Object r;
+        try {
+            r = Index.fetchOrThrow(args, cursor, count);
+        } catch (Throwable t) {
+            throw new Exception("TikTok's Favourites request failed: " + t.getMessage());
+        }
+        if (r == null) throw new Exception("no reply from TikTok");
+        int code = statusCode(r);
+        if (code != 0) throw new Exception("TikTok said status " + code);
+        List<String> ids = new ArrayList<>();
+        try {
+            List<?> items = (List<?>) invoke(r, "getItems");
+            if (items != null) {
+                for (Object aweme : items) {
+                    String id = aweme == null ? null : (String) invoke(aweme, "getAid");
+                    if (id != null && !id.isEmpty()) ids.add(id);
+                }
+            }
+        } catch (Throwable t) {
+            throw new Exception("couldn't read TikTok's page: " + t);
+        }
+        return new Page(ids, nextCursor(r), hasMore(r));
     }
 
     // --- the index ---------------------------------------------------------------------------
@@ -319,9 +383,13 @@ public final class FavoritesOrder {
 
         /** TikTok's own fetch for one page at a real cursor, with this thread let through. */
         static Object fetchOrThrow(Object[] args, long cursor) throws Throwable {
+            return fetchOrThrow(args, cursor, PAGE);
+        }
+
+        static Object fetchOrThrow(Object[] args, long cursor, int count) throws Throwable {
             Object[] a = args.clone();
             a[5] = cursor;
-            a[6] = PAGE;
+            a[6] = count;
             INSIDE.set(true);
             try {
                 return fetcher.invoke(null, a);
