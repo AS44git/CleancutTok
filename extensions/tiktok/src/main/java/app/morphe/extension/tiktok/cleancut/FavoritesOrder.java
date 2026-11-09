@@ -99,12 +99,17 @@ public final class FavoritesOrder {
                                int count, String a7, int a8, int a9, Integer a10, Object a11, boolean a12,
                                String a13, boolean a14, String a15, String a16, int a17, boolean a18,
                                String a19) throws Throwable {
+        if (!INSIDE.get()) {
+            // Every profile tab's request is remembered (whose list, which tab), for the tools.
+            ARGS_BY_TYPE.put(type, new Object[]{a0, a1, a2, type, minCursor, cursor, count, a7, a8, a9, a10,
+                    a11, a12, a13, a14, a15, a16, a17, a18, a19});
+            SEEN_AT.put(type, System.currentTimeMillis());
+        }
         if (type != FAVORITES || INSIDE.get() || fetcher == null) return null;
         FavoritesTabs.attachSoon();
         List<Long> pages;
         Object[] args = {a0, a1, a2, type, minCursor, cursor, count, a7, a8, a9, a10, a11, a12,
                 a13, a14, a15, a16, a17, a18, a19};
-        lastArgs = args;
         try {
             if (!oldestFirst()) return null;
             if (cursor < 0 || cursor >= MAX_TOKEN) return null;  // a real save time: not ours
@@ -159,67 +164,141 @@ public final class FavoritesOrder {
         return result;
     }
 
-    // --- one page, for the tools ---------------------------------------------------------------
+    // --- pages for the tools ------------------------------------------------------------------
 
-    /** The arguments of the last Favourites page TikTok asked for (whose list, and how). */
-    private static volatile Object[] lastArgs;
-    private static volatile Object[] ownArgs;
+    /** The arguments of the last request for each profile tab (by TikTok's tab type). */
+    private static final Map<Integer, Object[]> ARGS_BY_TYPE = new ConcurrentHashMap<>();
+    private static final Map<Integer, Long> SEEN_AT = new ConcurrentHashMap<>();
+    private static volatile Object[] favoritesArgs;
+    private static volatile Object[] likedArgs;
 
-    /** A page of favourites: ids newest first, the cursor after it (a save time), and if there's more. */
+    /** A page: ids newest first, the cursor after it, if there's more, and how many are liked by you. */
     static final class Page {
         final List<String> ids;
         final long next;
         final boolean more;
+        /** How many of the page's videos say you've liked them; -1 if TikTok's model doesn't say. */
+        final int liked;
 
-        Page(List<String> ids, long next, boolean more) {
+        Page(List<String> ids, long next, boolean more, int liked) {
             this.ids = ids;
             this.next = next;
             this.more = more;
+            this.liked = liked;
         }
+    }
+
+    /** Was this request for your own profile's tab (not someone else's)? */
+    private static boolean own(Object[] args, String uid, String secUid) {
+        String a1 = args[1] == null ? "" : String.valueOf(args[1]);
+        String a2 = args[2] == null ? "" : String.valueOf(args[2]);
+        if (a1.isEmpty() && a2.isEmpty()) return true;
+        return (uid != null && !uid.isEmpty() && (uid.equals(a1) || uid.equals(a2)))
+                || (secUid != null && !secUid.isEmpty() && (secUid.equals(a1) || secUid.equals(a2)));
     }
 
     /**
      * Your favourites saved before {@code cursor} (a save time in seconds), newest first, through
      * TikTok's own request for the Favourites tab: the same one the app makes when you scroll it.
-     * Only ever your own list: the arguments are checked against your own profile once.
      */
-    static Page page(long cursor, int count, String ownUid, String ownSecUid) throws Exception {
-        Object[] args = ownArgs;
+    static Page favoritesPage(long cursor, int count, String uid, String secUid) throws Exception {
+        Object[] args = favoritesArgs;
         if (args == null) {
-            Object[] seen = lastArgs;
+            Object[] seen = ARGS_BY_TYPE.get(FAVORITES);
             if (seen == null || fetcher == null) {
                 throw new Exception("open your own Favourites tab first (scroll it a little), then try again");
             }
-            String a1 = seen[1] == null ? "" : String.valueOf(seen[1]);
-            String a2 = seen[2] == null ? "" : String.valueOf(seen[2]);
-            boolean mine = (ownUid != null && !ownUid.isEmpty() && (ownUid.equals(a1) || ownUid.equals(a2)))
-                    || (ownSecUid != null && !ownSecUid.isEmpty() && (ownSecUid.equals(a1) || ownSecUid.equals(a2)))
-                    || (a1.isEmpty() && a2.isEmpty());
-            if (!mine) throw new Exception("open your own Favourites tab (not someone else's), then try again");
-            ownArgs = args = seen;
+            if (!own(seen, uid, secUid)) throw new Exception("open your own Favourites tab (not someone else's), then try again");
+            favoritesArgs = args = seen;
         }
+        return fetchPage(args, cursor, count);
+    }
+
+    /**
+     * Your liked videos, newest first, through TikTok's own request for the Liked tab. Which tab
+     * that is gets found once: of the tabs of your own profile opened recently (not Favourites), the
+     * one whose videos all say you've liked them.
+     */
+    static Page likedPage(long cursor, int count, String uid, String secUid) throws Exception {
+        Object[] args = likedArgs;
+        if (args == null) {
+            if (fetcher == null) throw new Exception("open your own Liked tab first (scroll it a little), then try again");
+            List<Integer> types = new ArrayList<>(ARGS_BY_TYPE.keySet());
+            types.remove(Integer.valueOf(FAVORITES));
+            Collections.sort(types, (x, y) -> Long.compare(
+                    SEEN_AT.containsKey(y) ? SEEN_AT.get(y) : 0L, SEEN_AT.containsKey(x) ? SEEN_AT.get(x) : 0L));
+            Object[] fallback = null;
+            for (int t : types) {
+                Object[] a = ARGS_BY_TYPE.get(t);
+                if (a == null || !own(a, uid, secUid)) continue;
+                Page p = fetchPage(a, 0, 12);
+                Cleancut.favLog("tab type " + t + ": " + p.ids.size() + " videos, liked " + p.liked);
+                if (p.ids.isEmpty()) continue;
+                if (p.liked == p.ids.size()) { args = a; break; }
+                if (p.liked < 0 && t != 0 && fallback == null) fallback = a;   // can't tell: most recent other tab
+            }
+            if (args == null) args = fallback;
+            if (args == null) throw new Exception("open your own Liked tab first (scroll it a little), then try again");
+            likedArgs = args;
+        }
+        return fetchPage(args, cursor, count);
+    }
+
+    private static Page fetchPage(Object[] args, long cursor, int count) throws Exception {
         Object r;
         try {
             r = Index.fetchOrThrow(args, cursor, count);
         } catch (Throwable t) {
-            throw new Exception("TikTok's Favourites request failed: " + t.getMessage());
+            throw new Exception("TikTok's request failed: " + t.getMessage());
         }
         if (r == null) throw new Exception("no reply from TikTok");
         int code = statusCode(r);
         if (code != 0) throw new Exception("TikTok said status " + code);
         List<String> ids = new ArrayList<>();
+        int liked = 0;
+        boolean known = true;
         try {
             List<?> items = (List<?>) invoke(r, "getItems");
             if (items != null) {
                 for (Object aweme : items) {
                     String id = aweme == null ? null : (String) invoke(aweme, "getAid");
-                    if (id != null && !id.isEmpty()) ids.add(id);
+                    if (id == null || id.isEmpty()) continue;
+                    ids.add(id);
+                    int d = diggedByMe(aweme);
+                    if (d < 0) known = false; else if (d > 0) liked++;
                 }
             }
         } catch (Throwable t) {
             throw new Exception("couldn't read TikTok's page: " + t);
         }
-        return new Page(ids, nextCursor(r), hasMore(r));
+        return new Page(ids, nextCursor(r), hasMore(r), known ? liked : -1);
+    }
+
+    /** 1 if you've liked this video, 0 if not, -1 if TikTok's model doesn't say. */
+    private static int diggedByMe(Object aweme) {
+        for (Class<?> c = aweme.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (String name : new String[]{"user_digged", "userDigged", "userDigg"}) {
+                try {
+                    java.lang.reflect.Field f = c.getDeclaredField(name);
+                    f.setAccessible(true);
+                    Object v = f.get(aweme);
+                    if (v instanceof Number) return ((Number) v).intValue() > 0 ? 1 : 0;
+                    if (v instanceof Boolean) return (Boolean) v ? 1 : 0;
+                } catch (Throwable ignored) {
+                    // next name
+                }
+            }
+        }
+        for (String name : new String[]{"getUserDigg", "getUserDigged", "isUserDigg", "isUserDigged"}) {
+            try {
+                Object v = aweme.getClass().getMethod(name).invoke(aweme);
+                if (v instanceof Number) return ((Number) v).intValue() > 0 ? 1 : 0;
+                if (v instanceof Boolean) return (Boolean) v ? 1 : 0;
+            } catch (Throwable ignored) {
+                // next name
+            }
+        }
+        return -1;
     }
 
     // --- the index ---------------------------------------------------------------------------

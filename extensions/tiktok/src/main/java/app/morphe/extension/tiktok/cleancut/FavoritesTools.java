@@ -16,10 +16,18 @@ import org.json.JSONObject;
 
 import java.lang.reflect.Method;
 import java.text.NumberFormat;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
 
 import app.morphe.extension.shared.Utils;
 
@@ -27,26 +35,52 @@ import app.morphe.extension.shared.Utils;
  * Long-press Posts in the Favourites row: tools for favourite videos and liked videos.
  *
  * <ul>
- *   <li>Remove the favourites saved in a year, or the oldest N. Favourites are listed by save
- *       time ({@code /aweme/v1/aweme/listcollection/}, cursor = a save time, newest first), so a
- *       year is the list from 1 January of the next year down to 1 January of that year; the page
- *       that crosses the boundary is walked one video at a time to cut it exactly.</li>
- *   <li>Each is unfavourited with TikTok's request for that, {@code /aweme/v1/aweme/collect/
- *       ?aweme_id=…&action=0}, one every 1.2 s, pausing if TikTok refuses; what's left is kept, so
- *       a cut-off run continues from the menu.</li>
- *   <li>Remove unavailable favourite videos: what TikTok's own banner does,
- *       {@code /aweme/v1/aweme/collect/removeinvalid}.</li>
- *   <li>Count liked videos: {@code favoriting_count} from your own profile
- *       ({@code /aweme/v1/user/profile/self/}); the Liked list itself stops loading long before
- *       the end.</li>
+ *   <li>Favourites: remove those saved in a year, or the oldest N. They're listed through
+ *       TikTok's own request for the Favourites tab (the one it makes as you scroll it), which
+ *       pages by save time, newest first; a year is the list from 1 January of the next year
+ *       down to 1 January of that year, the page crossing the boundary walked one at a time.</li>
+ *   <li>Liked videos: remove the most recent N, through TikTok's own request for the Liked tab.
+ *       TikTok only lists recent likes, so it's newest first; removing them lets older ones
+ *       appear for the next run.</li>
+ *   <li>Each is undone with TikTok's request for it ({@code /aweme/v1/aweme/collect/?action=0},
+ *       {@code /aweme/v1/commit/item/digg/?type=0}), one at a time at a steady, slightly varied
+ *       pace, with a daily limit; refusals slow it down, then stop it until tomorrow. What's left
+ *       is kept, so it continues from the menu.</li>
+ *   <li>Remove unavailable favourite videos: what TikTok's own banner does.</li>
  * </ul>
  * Nothing is removed until what was found has been shown and confirmed.
  */
 public final class FavoritesTools {
     private static final String HOST = "https://api16-va.tiktokv.com";
     private static final String PREFS = "cleancut_favorites";
-    private static final long REMOVE_EVERY_MS = 1200;
     private static volatile boolean busy;
+    private static final Random RANDOM = new Random();
+
+    /** What a run removes, and how gently. */
+    private enum Kind {
+        FAVOURITES("favourites", "remove_pending", 1500, 1200),
+        LIKES("likes", "likes_pending", 1000, 1600);
+
+        final String noun;
+        final String key;
+        /** At most this many a day. */
+        final int daily;
+        /** Milliseconds between removals (plus up to 0.6 s at random). */
+        final long every;
+
+        Kind(String noun, String key, int daily, long every) {
+            this.noun = noun;
+            this.key = key;
+            this.daily = daily;
+            this.every = every;
+        }
+
+        String url(String id) {
+            return this == FAVOURITES
+                    ? HOST + "/aweme/v1/aweme/collect/?action=0&aweme_id=" + id
+                    : HOST + "/aweme/v1/commit/item/digg/?type=0&aweme_id=" + id;
+        }
+    }
 
     private FavoritesTools() {}
 
@@ -57,18 +91,21 @@ public final class FavoritesTools {
         if (activity == null) return;
         List<String> labels = new ArrayList<>();
         List<Runnable> actions = new ArrayList<>();
-        List<String> pending = pending();
-        if (!pending.isEmpty()) {
-            labels.add("Continue removing (" + fmt(pending.size()) + " left)");
-            actions.add(() -> confirmRemove(pending, "Continue removing " + fmt(pending.size()) + " favourites?", null));
+        for (Kind k : Kind.values()) {
+            List<String> pending = pending(k);
+            if (pending.isEmpty()) continue;
+            labels.add("Continue removing " + k.noun + " (" + fmt(pending.size()) + " left)");
+            actions.add(() -> confirmRemove(k, pending, "Continue removing " + fmt(pending.size()) + " " + k.noun + "?", null));
         }
-        labels.add("Remove favourites from a year…");
+        labels.add("Favourites: remove those from a year…");
         actions.add(FavoritesTools::pickYear);
-        labels.add("Remove my oldest favourites…");
+        labels.add("Favourites: remove my oldest…");
         actions.add(FavoritesTools::pickOldest);
-        labels.add("Remove unavailable favourite videos");
+        labels.add("Favourites: remove unavailable videos");
         actions.add(FavoritesTools::removeUnavailable);
-        labels.add("Count my liked videos");
+        labels.add("Liked: remove my most recent likes…");
+        actions.add(FavoritesTools::pickLikes);
+        labels.add("Liked: count my liked videos");
         actions.add(FavoritesTools::countLiked);
         boolean oldest = FavoritesOrder.oldestFirst();
         labels.add(oldest ? "Show favourites newest first" : "Show favourites oldest first");
@@ -77,7 +114,7 @@ public final class FavoritesTools {
             Utils.showToastLong((oldest ? "Newest" : "Oldest") + " first. Open Favourites again to see it.");
         });
         new AlertDialog.Builder(activity)
-                .setTitle("Favourites")
+                .setTitle("Favourites & likes")
                 .setItems(labels.toArray(new String[0]), (d, which) -> actions.get(which).run())
                 .show();
     }
@@ -95,10 +132,9 @@ public final class FavoritesTools {
                     work("Counting your favourites from " + year + "…", () -> {
                         List<String> ids = listBetween(startOfYear(year + 1), startOfYear(year), "from " + year);
                         Collections.reverse(ids);      // oldest first
-                        Utils.runOnMainThread(() -> confirmRemove(ids,
+                        Utils.runOnMainThread(() -> confirmRemove(Kind.FAVOURITES, ids,
                                 "Remove " + fmt(ids.size()) + " favourites saved in " + year + "?",
-                                "Oldest first. About " + minutes(ids.size()) + ". Keep TikTok open; if it's cut off, "
-                                        + "long-press Posts to continue."));
+                                "Oldest first. " + plan(Kind.FAVOURITES, ids.size())));
                     });
                 })
                 .show();
@@ -107,21 +143,48 @@ public final class FavoritesTools {
     private static void pickOldest() {
         Activity activity = Utils.getVisibleActivity();
         if (activity == null) return;
-        String[] choices = {"100", "250", "500", "1,000"};
-        int[] amounts = {100, 250, 500, 1000};
+        String[] choices = {"100", "250", "500", "1,000", "1,500 (a day's limit)"};
+        int[] amounts = {100, 250, 500, 1000, 1500};
         new AlertDialog.Builder(activity)
-                .setTitle("Remove my oldest…")
+                .setTitle("Remove my oldest favourites…")
                 .setItems(choices, (d, which) -> {
                     int n = amounts[which];
                     work("Finding your oldest " + fmt(n) + " favourites…", () -> {
                         List<String> ids = oldest(n);
-                        Utils.runOnMainThread(() -> confirmRemove(ids,
+                        Utils.runOnMainThread(() -> confirmRemove(Kind.FAVOURITES, ids,
                                 "Remove your oldest " + fmt(ids.size()) + " favourites?",
-                                "About " + minutes(ids.size()) + ". Keep TikTok open; if it's cut off, "
-                                        + "long-press Posts to continue."));
+                                "Oldest first. " + plan(Kind.FAVOURITES, ids.size())));
                     });
                 })
                 .show();
+    }
+
+    private static void pickLikes() {
+        Activity activity = Utils.getVisibleActivity();
+        if (activity == null) return;
+        String[] choices = {"100", "250", "500", "1,000 (a day's limit)"};
+        int[] amounts = {100, 250, 500, 1000};
+        new AlertDialog.Builder(activity)
+                .setTitle("Remove my most recent likes…")
+                .setItems(choices, (d, which) -> {
+                    int n = amounts[which];
+                    work("Finding your " + fmt(n) + " most recent likes…", () -> {
+                        List<String> ids = recentLikes(n);
+                        Utils.runOnMainThread(() -> confirmRemove(Kind.LIKES, ids,
+                                "Unlike your " + fmt(ids.size()) + " most recent liked videos?",
+                                "Newest first (TikTok only lists your recent likes; older ones show up as these go). "
+                                        + plan(Kind.LIKES, ids.size())));
+                    });
+                })
+                .show();
+    }
+
+    /** "About 9 minutes. Up to 1,500 a day; ..." */
+    private static String plan(Kind k, int n) {
+        int today = Math.max(0, k.daily - doneToday(k));
+        String s = "About " + minutes(k, Math.min(n, today)) + ". Up to " + fmt(k.daily) + " " + k.noun + " a day";
+        if (n > today) s += ": " + fmt(today) + " today, the rest from the menu on later days";
+        return s + ". Keep TikTok open; if it's cut off, long-press Posts to continue.";
     }
 
     // --- listing ------------------------------------------------------------------------------
@@ -173,17 +236,40 @@ public final class FavoritesTools {
 
     private static String ownUid, ownSecUid;
 
+    /** Your own user id, so only your own lists are ever used. */
+    private static void knowMe() throws Exception {
+        if (ownUid != null) return;
+        JSONObject user = new JSONObject(get(HOST + "/aweme/v1/user/profile/self/")).optJSONObject("user");
+        if (user == null) throw new Exception("couldn't read your profile; check you're online and try again");
+        ownUid = user.optString("uid", "");
+        ownSecUid = user.optString("sec_uid", "");
+    }
+
+    /** Your n most recent likes, newest first, through TikTok's own Liked tab request. */
+    private static List<String> recentLikes(int n) throws Exception {
+        knowMe();
+        List<String> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        long cursor = 0;
+        for (int page = 0; page < 200 && out.size() < n; page++) {
+            FavoritesOrder.Page p = FavoritesOrder.likedPage(cursor, 30, ownUid, ownSecUid);
+            sleep(300);
+            int added = 0;
+            for (String id : p.ids) if (seen.add(id)) { out.add(id); added++; }
+            if (!p.more || p.next <= 0 || p.next == cursor || added == 0) break;
+            cursor = p.next;
+            if (page % 10 == 9) Utils.showToastShort("Finding likes… " + fmt(out.size()) + " so far");
+        }
+        return out.size() > n ? new ArrayList<>(out.subList(0, n)) : out;
+    }
+
     /**
      * A page of your favourites through TikTok's own Favourites request (the one it makes when
      * you scroll the tab), at a gentle pace.
      */
     private static FavoritesOrder.Page page(long cursor, int count) throws Exception {
-        if (ownUid == null) {
-            JSONObject user = new JSONObject(get(HOST + "/aweme/v1/user/profile/self/")).optJSONObject("user");
-            ownUid = user == null ? "" : user.optString("uid", "");
-            ownSecUid = user == null ? "" : user.optString("sec_uid", "");
-        }
-        FavoritesOrder.Page p = FavoritesOrder.page(cursor, count, ownUid, ownSecUid);
+        knowMe();
+        FavoritesOrder.Page p = FavoritesOrder.favoritesPage(cursor, count, ownUid, ownSecUid);
         sleep(250);
         return p;
     }
@@ -204,48 +290,76 @@ public final class FavoritesTools {
 
     // --- removing -----------------------------------------------------------------------------
 
-    private static void confirmRemove(List<String> ids, String title, String note) {
+    private static void confirmRemove(Kind k, List<String> ids, String title, String note) {
         if (ids.isEmpty()) {
             Utils.showToastLong("Nothing to remove there.");
             return;
         }
         Activity activity = Utils.getVisibleActivity();
         if (activity == null) return;
+        long until = pausedUntil(k);
+        if (until > System.currentTimeMillis()) {
+            Utils.showToastLong("TikTok asked to slow down earlier: " + k.noun + " can be removed again after "
+                    + new SimpleDateFormat("EEE HH:mm", Locale.getDefault()).format(new Date(until)) + ".");
+            return;
+        }
         AlertDialog.Builder b = new AlertDialog.Builder(activity)
                 .setTitle(title)
                 .setPositiveButton("Remove", (d, w) -> {
-                    savePending(ids);
-                    work(null, () -> removeAll());
+                    savePending(k, ids);
+                    work(null, () -> removeAll(k));
                 })
                 .setNegativeButton("Cancel", null);
         if (note != null) b.setMessage(note);
         b.show();
     }
 
-    /** Unfavourites what's pending, oldest first, at a steady pace; what's left stays pending. */
-    private static void removeAll() {
-        List<String> left = new ArrayList<>(pending());
-        int total = left.size();
+    /**
+     * Removes what's pending, in order, one at a time with a little variety in the pace, within
+     * the day's limit. A video TikTok refuses is tried again later in the run, and given up after
+     * three tries (it may be gone). Several refusals in a row mean TikTok wants it slower: a
+     * minute's wait, then, if it goes on, a stop until tomorrow. What's left stays pending.
+     */
+    private static void removeAll(Kind k) {
+        List<String> left = new ArrayList<>(pending(k));
+        int allowance = k.daily - doneToday(k);
+        if (allowance <= 0) {
+            Utils.showToastLong("Today's limit of " + fmt(k.daily) + " " + k.noun + " is reached. "
+                    + fmt(left.size()) + " left: long-press Posts tomorrow to continue.");
+            return;
+        }
+        int total = Math.min(left.size(), allowance);
         int removed = 0;
-        int refusals = 0;
+        int inARow = 0;
         boolean usePost = false, triedPost = false;
-        Utils.showToastLong("Removing " + fmt(total) + " favourites, oldest first…");
+        Map<String, Integer> tries = new HashMap<>();
+        Utils.showToastLong("Removing " + fmt(total) + " " + k.noun + "…");
         while (!left.isEmpty()) {
+            if (removed >= allowance) {
+                savePending(k, left);
+                Utils.showToastLong("Removed " + fmt(removed) + " " + k.noun + ": today's limit. "
+                        + fmt(left.size()) + " left: long-press Posts tomorrow to continue.");
+                return;
+            }
             String id = left.get(0);
             String why;
             try {
-                String url = HOST + "/aweme/v1/aweme/collect/?action=0&aweme_id=" + id;
+                String url = k.url(id);
                 String raw = usePost ? post(url) : get(url);
                 JSONObject r = new JSONObject(raw);
                 int code = r.optInt("status_code", -1);
                 if (code != 0 && !usePost && !triedPost) {
                     // Some TikTok versions want this one as a POST: try that once, keep what works.
                     triedPost = true;
-                    Cleancut.favLog("unfavourite GET " + id + ": " + raw);
-                    String raw2 = post(url);
-                    JSONObject r2 = new JSONObject(raw2);
-                    Cleancut.favLog("unfavourite POST " + id + ": " + raw2);
-                    if (r2.optInt("status_code", -1) == 0) { usePost = true; r = r2; code = 0; }
+                    Cleancut.favLog(k.noun + " GET " + id + ": " + raw);
+                    try {
+                        String raw2 = post(url);
+                        Cleancut.favLog(k.noun + " POST " + id + ": " + raw2);
+                        JSONObject r2 = new JSONObject(raw2);
+                        if (r2.optInt("status_code", -1) == 0) { usePost = true; r = r2; code = 0; }
+                    } catch (Throwable t) {
+                        Cleancut.favLog(k.noun + " POST " + id + ": " + t);
+                    }
                 }
                 String msg = r.optString("status_msg", "");
                 why = code == 0 ? null : (msg.isEmpty() ? "status " + code : msg);
@@ -255,29 +369,109 @@ public final class FavoritesTools {
             if (why == null) {
                 left.remove(0);
                 removed++;
-                refusals = 0;
-                if (removed % 10 == 0) savePending(left);
-                if (removed % 50 == 0) Utils.showToastShort("Removed " + fmt(removed) + " of " + fmt(total) + "…");
-                sleep(REMOVE_EVERY_MS);
+                inARow = 0;
+                countToday(k);
+                if (removed % 10 == 0) savePending(k, left);
+                if (removed % 50 == 0) Utils.showToastShort("Removed " + fmt(removed) + " of " + fmt(total) + " " + k.noun + "…");
+                sleep(k.every + RANDOM.nextInt(600));
                 continue;
             }
-            Cleancut.favLog("unfavourite " + id + ": " + why);
-            refusals++;
-            if (refusals == 3) {
-                // TikTok is pushing back (too fast, or a problem): wait a minute and try again.
+            Cleancut.favLog("remove " + k.noun + " " + id + ": " + why);
+            inARow++;
+            left.remove(0);
+            int t = tries.containsKey(id) ? tries.get(id) + 1 : 1;
+            tries.put(id, t);
+            if (t < 3) left.add(id);          // later in the run, once more
+            if (inARow >= 6 && removed == 0) {
+                // Refused from the very first one: not TikTok slowing things down, something's wrong.
+                savePending(k, left);
+                Utils.showToastLong("TikTok refused every one (" + why + "), so nothing was removed. "
+                        + "The details are in cleancut-favourites.txt for Claude.");
+                return;
+            } else if (inARow >= 6) {
+                pauseUntilTomorrow(k);
+                savePending(k, left);
+                Utils.showToastLong("Stopped after " + fmt(removed) + " (TikTok: " + why + "). Resting until tomorrow; "
+                        + fmt(left.size()) + " left: long-press Posts then to continue.");
+                return;
+            } else if (inARow == 3) {
                 Utils.showToastLong("TikTok is slowing things down, waiting a minute… (" + why + ")");
                 sleep(60_000);
-            } else if (refusals >= 6) {
-                savePending(left);
-                Utils.showToastLong("Stopped after " + fmt(removed) + " (TikTok: " + why + "). "
-                        + fmt(left.size()) + " left: long-press Posts later to continue.");
-                return;
             } else {
-                sleep(3_000);
+                sleep(4_000);
             }
         }
-        savePending(left);
-        Utils.showToastLong("Done: removed " + fmt(removed) + " favourites. Open Favourites again to see the new count.");
+        savePending(k, left);
+        Utils.showToastLong("Done: removed " + fmt(removed) + " " + k.noun + ". Open the tab again to see the new count.");
+    }
+
+    private static String minutes(Kind k, int n) {
+        long m = Math.max(1, Math.round(n * (k.every + 300 + 400) / 60000.0));
+        return m >= 90 ? (Math.round(m / 6.0) / 10.0) + " hours" : m + (m == 1 ? " minute" : " minutes");
+    }
+
+    private static String fmt(long n) {
+        return NumberFormat.getIntegerInstance().format(n);
+    }
+
+    private static String get(String url) throws Exception {
+        return FavoritesTabs.get(url);
+    }
+
+    /** A POST through TikTok's own network stack (parameters in the address, empty form). */
+    private static String post(String url) throws Exception {
+        Class<?> utils = Class.forName("com.ss.android.common.util.NetworkUtils");
+        Method m = utils.getMethod("executePost", int.class, String.class, List.class);
+        try {
+            return (String) m.invoke(null, 1024 * 1024, url, new ArrayList<>());
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) throw (Exception) cause;
+            throw e;
+        }
+    }
+
+    private static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // --- the day's limit and rests -------------------------------------------------------------
+
+    private static String today() {
+        return new SimpleDateFormat("yyyyMMdd", Locale.US).format(new Date());
+    }
+
+    private static int doneToday(Kind k) {
+        SharedPreferences p = prefs();
+        if (p == null) return 0;
+        return today().equals(p.getString(k.key + "_day", "")) ? p.getInt(k.key + "_today", 0) : 0;
+    }
+
+    private static void countToday(Kind k) {
+        SharedPreferences p = prefs();
+        if (p == null) return;
+        p.edit().putString(k.key + "_day", today()).putInt(k.key + "_today", doneToday(k) + 1).apply();
+    }
+
+    private static long pausedUntil(Kind k) {
+        SharedPreferences p = prefs();
+        return p == null ? 0 : p.getLong(k.key + "_rest", 0);
+    }
+
+    /** Until 6 in the morning after next midnight, and at least 8 hours. */
+    private static void pauseUntilTomorrow(Kind k) {
+        Calendar c = Calendar.getInstance();
+        c.add(Calendar.DAY_OF_YEAR, 1);
+        c.set(Calendar.HOUR_OF_DAY, 6);
+        c.set(Calendar.MINUTE, 0);
+        c.set(Calendar.SECOND, 0);
+        long until = Math.max(c.getTimeInMillis(), System.currentTimeMillis() + 8 * 3600_000L);
+        SharedPreferences p = prefs();
+        if (p != null) p.edit().putLong(k.key + "_rest", until).apply();
     }
 
     private static void removeUnavailable() {
@@ -306,14 +500,17 @@ public final class FavoritesTools {
                 if (k.endsWith("_count") || k.startsWith("total_")) counts.append(k).append('=').append(user.opt(k)).append(' ');
             }
             Cleancut.favLog("profile counts: " + counts);
+            int likesToday = doneToday(Kind.LIKES), favsToday = doneToday(Kind.FAVOURITES);
             Utils.runOnMainThread(() -> {
                 Activity activity = Utils.getVisibleActivity();
                 if (activity == null) return;
                 new AlertDialog.Builder(activity)
                         .setTitle("Liked videos")
-                        .setMessage(liked >= 0
-                                ? "You've liked " + fmt(liked) + " videos.\n\n(TikTok's Liked list stops loading long before the end; this is the full count from your profile.)"
+                        .setMessage((liked >= 0
+                                ? "You've liked " + fmt(liked) + " videos."
                                 : "TikTok didn't send the count this time.")
+                                + "\n\nRemoved today: " + fmt(likesToday) + " of " + fmt(Kind.LIKES.daily) + " likes, "
+                                + fmt(favsToday) + " of " + fmt(Kind.FAVOURITES.daily) + " favourites.")
                         .setPositiveButton("OK", null)
                         .show();
             });
@@ -347,17 +544,17 @@ public final class FavoritesTools {
         t.start();
     }
 
-    private static List<String> pending() {
+    private static List<String> pending(Kind k) {
         SharedPreferences p = prefs();
         List<String> out = new ArrayList<>();
         if (p == null) return out;
-        for (String s : p.getString("remove_pending", "").split(",")) if (!s.isEmpty()) out.add(s);
+        for (String s : p.getString(k.key, "").split(",")) if (!s.isEmpty()) out.add(s);
         return out;
     }
 
-    private static void savePending(List<String> ids) {
+    private static void savePending(Kind k, List<String> ids) {
         SharedPreferences p = prefs();
-        if (p != null) p.edit().putString("remove_pending", android.text.TextUtils.join(",", ids)).apply();
+        if (p != null) p.edit().putString(k.key, android.text.TextUtils.join(",", ids)).apply();
     }
 
     private static SharedPreferences prefs() {
@@ -370,39 +567,5 @@ public final class FavoritesTools {
         c.clear();
         c.set(year, Calendar.JANUARY, 1, 0, 0, 0);
         return c.getTimeInMillis() / 1000;
-    }
-
-    private static String minutes(int n) {
-        long m = Math.max(1, Math.round(n * (REMOVE_EVERY_MS + 400) / 60000.0));
-        return m + (m == 1 ? " minute" : " minutes");
-    }
-
-    private static String fmt(long n) {
-        return NumberFormat.getIntegerInstance().format(n);
-    }
-
-    private static String get(String url) throws Exception {
-        return FavoritesTabs.get(url);
-    }
-
-    /** A POST through TikTok's own network stack (parameters in the address, empty form). */
-    private static String post(String url) throws Exception {
-        Class<?> utils = Class.forName("com.ss.android.common.util.NetworkUtils");
-        Method m = utils.getMethod("executePost", int.class, String.class, List.class);
-        try {
-            return (String) m.invoke(null, 1024 * 1024, url, new ArrayList<>());
-        } catch (java.lang.reflect.InvocationTargetException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof Exception) throw (Exception) cause;
-            throw e;
-        }
-    }
-
-    private static void sleep(long ms) {
-        try {
-            Thread.sleep(ms);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
     }
 }
