@@ -54,6 +54,8 @@ public final class FavoritesTools {
     private static final String HOST = "https://api16-va.tiktokv.com";
     private static final String PREFS = "cleancut_favorites";
     private static volatile boolean busy;
+    /** How many likes the chosen run is for (the list is read again from the top as they go). */
+    private static volatile int likesWanted;
     private static final Random RANDOM = new Random();
 
     /** What a run removes, and how gently. */
@@ -93,9 +95,18 @@ public final class FavoritesTools {
         List<Runnable> actions = new ArrayList<>();
         for (Kind k : Kind.values()) {
             List<String> pending = pending(k);
-            if (pending.isEmpty()) continue;
-            labels.add("Continue removing " + k.noun + " (" + fmt(pending.size()) + " left)");
-            actions.add(() -> confirmRemove(k, pending, "Continue removing " + fmt(pending.size()) + " " + k.noun + "?", null));
+            int count = k == Kind.LIKES ? Math.max(pending.size(), targetLeft(k)) : pending.size();
+            if (count == 0) continue;
+            labels.add("Continue removing " + k.noun + " (" + fmt(count) + " left)");
+            actions.add(() -> {
+                likesWanted = count;
+                if (pending.isEmpty()) {
+                    // Likes with none listed yet: they're read from the top of the Liked list as it goes.
+                    confirmRemove(k, Collections.singletonList(""), "Continue removing " + fmt(count) + " " + k.noun + "?", null);
+                } else {
+                    confirmRemove(k, pending, "Continue removing " + fmt(count) + " " + k.noun + "?", null);
+                }
+            });
         }
         labels.add("Favourites: remove those from a year…");
         actions.add(FavoritesTools::pickYear);
@@ -168,10 +179,11 @@ public final class FavoritesTools {
                 .setTitle("Remove my most recent likes…")
                 .setItems(choices, (d, which) -> {
                     int n = amounts[which];
+                    likesWanted = n;
                     work("Finding your " + fmt(n) + " most recent likes…", () -> {
                         List<String> ids = recentLikes(n);
                         Utils.runOnMainThread(() -> confirmRemove(Kind.LIKES, ids,
-                                "Unlike your " + fmt(ids.size()) + " most recent liked videos?",
+                                "Unlike your " + fmt(Math.max(ids.size(), n)) + " most recent liked videos?",
                                 "Newest first (TikTok only lists your recent likes; older ones show up as these go). "
                                         + plan(Kind.LIKES, ids.size())));
                     });
@@ -192,7 +204,7 @@ public final class FavoritesTools {
     /** Ids of favourites saved in [notBefore, before), newest first. */
     private static List<String> listBetween(long before, long notBefore, String what) throws Exception {
         List<String> out = new ArrayList<>();
-        long cursor = before;
+        long cursor = Math.min(before, System.currentTimeMillis() / 1000);   // never a time to come
         for (int page = 0; page < 500; page++) {
             FavoritesOrder.Page p = page(cursor, 30);
             if (p.next >= notBefore || notBefore == 0) {
@@ -204,7 +216,13 @@ public final class FavoritesTools {
                 // video's save time) until the save times go past it.
                 long c = cursor;
                 for (int i = 0; i < 40; i++) {
-                    FavoritesOrder.Page one = page(c, 1);
+                    FavoritesOrder.Page one;
+                    try {
+                        one = page(c, 1);
+                    } catch (Exception e) {
+                        Cleancut.favLog("year edge, one at a time: " + e.getMessage());
+                        break;          // the few right at the edge stay; the rest is exact
+                    }
                     if (one.next < notBefore) break;
                     out.addAll(one.ids);
                     if (!one.more || one.next <= 0 || one.next >= c) break;
@@ -222,7 +240,8 @@ public final class FavoritesTools {
         int now = Calendar.getInstance().get(Calendar.YEAR);
         int first = -1;
         for (int y = 2014; y <= now; y++) {
-            if (!page(startOfYear(y + 1), 1).ids.isEmpty()) { first = y; break; }
+            if (startOfYear(y + 1) > System.currentTimeMillis() / 1000) { first = y; break; }
+            if (!page(startOfYear(y + 1), 30).ids.isEmpty()) { first = y; break; }
         }
         List<String> out = new ArrayList<>();
         if (first < 0) return out;
@@ -307,6 +326,7 @@ public final class FavoritesTools {
                 .setTitle(title)
                 .setPositiveButton("Remove", (d, w) -> {
                     savePending(k, ids);
+                    saveTarget(k, k == Kind.LIKES ? Math.max(ids.size(), likesWanted) : ids.size());
                     work(null, () -> removeAll(k));
                 })
                 .setNegativeButton("Cancel", null);
@@ -322,23 +342,34 @@ public final class FavoritesTools {
      */
     private static void removeAll(Kind k) {
         List<String> left = new ArrayList<>(pending(k));
+        // Likes: the target count; as the found ones go, the Liked list's top is read again.
+        int target = k == Kind.LIKES ? Math.max(left.size(), targetLeft(k)) : left.size();
+        Set<String> done = new HashSet<>();
         int allowance = k.daily - doneToday(k);
         if (allowance <= 0) {
             Utils.showToastLong("Today's limit of " + fmt(k.daily) + " " + k.noun + " is reached. "
                     + fmt(left.size()) + " left: long-press Posts tomorrow to continue.");
             return;
         }
-        int total = Math.min(left.size(), allowance);
+        int total = Math.min(target, allowance);
         int removed = 0;
         int inARow = 0;
         boolean usePost = false, triedPost = false;
         Map<String, Integer> tries = new HashMap<>();
         Utils.showToastLong("Removing " + fmt(total) + " " + k.noun + "…");
-        while (!left.isEmpty()) {
+        while (true) {
+            if (left.isEmpty()) {
+                if (k != Kind.LIKES || removed >= target) break;
+                List<String> more = refillLikes(done, target - removed);
+                if (more.isEmpty()) break;
+                left.addAll(more);
+            }
+            if (removed >= target) break;
             if (removed >= allowance) {
                 savePending(k, left);
+                saveTarget(k, target - removed);
                 Utils.showToastLong("Removed " + fmt(removed) + " " + k.noun + ": today's limit. "
-                        + fmt(left.size()) + " left: long-press Posts tomorrow to continue.");
+                        + fmt(k == Kind.LIKES ? target - removed : left.size()) + " left: long-press Posts tomorrow to continue.");
                 return;
             }
             String id = left.get(0);
@@ -368,6 +399,7 @@ public final class FavoritesTools {
             }
             if (why == null) {
                 left.remove(0);
+                done.add(id);
                 removed++;
                 inARow = 0;
                 countToday(k);
@@ -382,15 +414,18 @@ public final class FavoritesTools {
             int t = tries.containsKey(id) ? tries.get(id) + 1 : 1;
             tries.put(id, t);
             if (t < 3) left.add(id);          // later in the run, once more
+            else done.add(id);
             if (inARow >= 6 && removed == 0) {
                 // Refused from the very first one: not TikTok slowing things down, something's wrong.
                 savePending(k, left);
+                saveTarget(k, target);
                 Utils.showToastLong("TikTok refused every one (" + why + "), so nothing was removed. "
                         + "The details are in cleancut-favourites.txt for Claude.");
                 return;
             } else if (inARow >= 6) {
                 pauseUntilTomorrow(k);
                 savePending(k, left);
+                saveTarget(k, target - removed);
                 Utils.showToastLong("Stopped after " + fmt(removed) + " (TikTok: " + why + "). Resting until tomorrow; "
                         + fmt(left.size()) + " left: long-press Posts then to continue.");
                 return;
@@ -402,6 +437,7 @@ public final class FavoritesTools {
             }
         }
         savePending(k, left);
+        saveTarget(k, 0);
         Utils.showToastLong("Done: removed " + fmt(removed) + " " + k.noun + ". Open the tab again to see the new count.");
     }
 
@@ -437,6 +473,35 @@ public final class FavoritesTools {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    private static int targetLeft(Kind k) {
+        SharedPreferences p = prefs();
+        return p == null ? 0 : p.getInt(k.key + "_target", 0);
+    }
+
+    private static void saveTarget(Kind k, int n) {
+        SharedPreferences p = prefs();
+        if (p != null) p.edit().putInt(k.key + "_target", Math.max(0, n)).apply();
+    }
+
+    /** The newest likes now (the ones just unliked are gone from the top), minus any already done. */
+    private static List<String> refillLikes(Set<String> done, int want) {
+        List<String> out = new ArrayList<>();
+        try {
+            knowMe();
+            long cursor = 0;
+            for (int page = 0; page < 3 && out.size() < want; page++) {
+                FavoritesOrder.Page p = FavoritesOrder.likedPage(cursor, 30, ownUid, ownSecUid);
+                sleep(400);
+                for (String id : p.ids) if (!done.contains(id) && !out.contains(id)) out.add(id);
+                if (!out.isEmpty() || !p.more || p.next <= 0 || p.next == cursor) break;
+                cursor = p.next;    // the top was all done already (TikTok catching up): look further
+            }
+        } catch (Exception e) {
+            Cleancut.favLog("likes refill: " + e.getMessage());
+        }
+        return out.size() > want ? new ArrayList<>(out.subList(0, want)) : out;
     }
 
     // --- the day's limit and rests -------------------------------------------------------------

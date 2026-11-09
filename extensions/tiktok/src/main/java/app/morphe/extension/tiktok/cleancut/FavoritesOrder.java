@@ -100,9 +100,15 @@ public final class FavoritesOrder {
                                String a13, boolean a14, String a15, String a16, int a17, boolean a18,
                                String a19) throws Throwable {
         if (!INSIDE.get()) {
-            // Every profile tab's request is remembered (whose list, which tab), for the tools.
-            ARGS_BY_TYPE.put(type, new Object[]{a0, a1, a2, type, minCursor, cursor, count, a7, a8, a9, a10,
-                    a11, a12, a13, a14, a15, a16, a17, a18, a19});
+            // Every profile tab's request for its first page is remembered (whose list, which tab),
+            // for the tools: a later page's request doesn't work sent again (TikTok: error 4).
+            if (cursor == 0 || !ARGS_BY_TYPE.containsKey(type)) {
+                ARGS_BY_TYPE.put(type, new Object[]{a0, a1, a2, type, minCursor, cursor, count, a7, a8, a9, a10,
+                        a11, a12, a13, a14, a15, a16, a17, a18, a19});
+                FIRST_PAGE.put(type, cursor == 0);
+                if (type == FAVORITES) favoritesArgs = null;
+                else likedArgs = null;
+            }
             SEEN_AT.put(type, System.currentTimeMillis());
         }
         if (type != FAVORITES || INSIDE.get() || fetcher == null) return null;
@@ -169,6 +175,7 @@ public final class FavoritesOrder {
     /** The arguments of the last request for each profile tab (by TikTok's tab type). */
     private static final Map<Integer, Object[]> ARGS_BY_TYPE = new ConcurrentHashMap<>();
     private static final Map<Integer, Long> SEEN_AT = new ConcurrentHashMap<>();
+    private static final Map<Integer, Boolean> FIRST_PAGE = new ConcurrentHashMap<>();
     private static volatile Object[] favoritesArgs;
     private static volatile Object[] likedArgs;
 
@@ -231,8 +238,14 @@ public final class FavoritesOrder {
             for (int t : types) {
                 Object[] a = ARGS_BY_TYPE.get(t);
                 if (a == null || !own(a, uid, secUid)) continue;
-                Page p = fetchPage(a, 0, 12);
-                Cleancut.favLog("tab type " + t + ": " + p.ids.size() + " videos, liked " + p.liked);
+                Page p;
+                try {
+                    p = fetchPage(a, 0, 12);
+                } catch (Exception e) {
+                    continue;
+                }
+                Cleancut.favLog("tab type " + t + " (first page " + FIRST_PAGE.get(t) + "): " + p.ids.size()
+                        + " videos, liked " + p.liked);
                 if (p.ids.isEmpty()) continue;
                 if (p.liked == p.ids.size()) { args = a; break; }
                 if (p.liked < 0 && t != 0 && fallback == null) fallback = a;   // can't tell: most recent other tab
@@ -249,7 +262,10 @@ public final class FavoritesOrder {
         try {
             r = Index.fetchOrThrow(args, cursor, count);
         } catch (Throwable t) {
-            throw new Exception("TikTok's request failed: " + t.getMessage());
+            Cleancut.favLog("page type " + args[3] + " at " + cursor + " x" + count + " (first-page request "
+                    + FIRST_PAGE.get(args[3]) + "): " + t);
+            throw new Exception("TikTok's request failed: " + t.getMessage()
+                    + (Boolean.FALSE.equals(FIRST_PAGE.get(args[3])) ? " (close and reopen the tab, then try again)" : ""));
         }
         if (r == null) throw new Exception("no reply from TikTok");
         int code = statusCode(r);
