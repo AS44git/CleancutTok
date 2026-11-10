@@ -60,8 +60,8 @@ public final class FavoritesTools {
 
     /** What a run removes, and how gently. */
     private enum Kind {
-        FAVOURITES("favourites", "remove_pending", 1500, 1200),
-        LIKES("likes", "likes_pending", 1000, 1600);
+        FAVOURITES("favourites", "remove_pending", 1500, 1200, false),
+        LIKES("likes", "likes_pending", 1000, 1600, true);
 
         final String noun;
         final String key;
@@ -70,11 +70,15 @@ public final class FavoritesTools {
         /** Milliseconds between removals (plus up to 0.6 s at random). */
         final long every;
 
-        Kind(String noun, String key, int daily, long every) {
+        /** TikTok's own app sends this one as a POST (parameters in the address). */
+        final boolean post;
+
+        Kind(String noun, String key, int daily, long every, boolean post) {
             this.noun = noun;
             this.key = key;
             this.daily = daily;
             this.every = every;
+            this.post = post;
         }
 
         String url(String id) {
@@ -354,8 +358,10 @@ public final class FavoritesTools {
         int total = Math.min(target, allowance);
         int removed = 0;
         int inARow = 0;
-        boolean usePost = false, triedPost = false;
+        boolean usePost = k.post, triedPost = k.post;
         Map<String, Integer> tries = new HashMap<>();
+        List<String> firstDone = new ArrayList<>();
+        boolean checked = k != Kind.LIKES;
         Utils.showToastLong("Removing " + fmt(total) + " " + k.noun + "…");
         while (true) {
             if (left.isEmpty()) {
@@ -379,15 +385,15 @@ public final class FavoritesTools {
                 String raw = usePost ? post(url) : get(url);
                 JSONObject r = new JSONObject(raw);
                 int code = r.optInt("status_code", -1);
-                if (code != 0 && !usePost && !triedPost) {
-                    // Some TikTok versions want this one as a POST: try that once, keep what works.
+                if (code != 0 && !triedPost) {
+                    // Not the way that worked so far: try the other (GET/POST) once, keep what works.
                     triedPost = true;
-                    Cleancut.favLog(k.noun + " GET " + id + ": " + raw);
+                    Cleancut.favLog(k.noun + (usePost ? " POST " : " GET ") + id + ": " + raw);
                     try {
-                        String raw2 = post(url);
-                        Cleancut.favLog(k.noun + " POST " + id + ": " + raw2);
+                        String raw2 = usePost ? get(url) : post(url);
+                        Cleancut.favLog(k.noun + (usePost ? " GET " : " POST ") + id + ": " + raw2);
                         JSONObject r2 = new JSONObject(raw2);
-                        if (r2.optInt("status_code", -1) == 0) { usePost = true; r = r2; code = 0; }
+                        if (r2.optInt("status_code", -1) == 0) { usePost = !usePost; r = r2; code = 0; }
                     } catch (Throwable t) {
                         Cleancut.favLog(k.noun + " POST " + id + ": " + t);
                     }
@@ -403,6 +409,20 @@ public final class FavoritesTools {
                 removed++;
                 inARow = 0;
                 countToday(k);
+                if (firstDone.size() < 3) firstDone.add(id);
+                if (!checked && firstDone.size() == 3) {
+                    // TikTok said yes three times: check the three really left your Liked list.
+                    checked = true;
+                    String stuck = stillLiked(firstDone);
+                    if (stuck != null) {
+                        savePending(k, left);
+                        saveTarget(k, target - removed);
+                        Cleancut.favLog("likes said removed but still in the Liked list: " + stuck);
+                        Utils.showToastLong("Stopped: TikTok said yes but those likes are still there. Nothing else was "
+                                + "touched; the details are in cleancut-favourites.txt for Claude.");
+                        return;
+                    }
+                }
                 if (removed % 10 == 0) savePending(k, left);
                 if (removed % 50 == 0) Utils.showToastShort("Removed " + fmt(removed) + " of " + fmt(total) + " " + k.noun + "…");
                 sleep(k.every + RANDOM.nextInt(600));
@@ -475,6 +495,23 @@ public final class FavoritesTools {
         }
     }
 
+    /** Which of these are still at the top of your Liked list (checked twice, a few seconds apart); null if none. */
+    private static String stillLiked(List<String> ids) {
+        try {
+            for (int attempt = 0; attempt < 2; attempt++) {
+                sleep(attempt == 0 ? 2500 : 6000);
+                FavoritesOrder.Page p = FavoritesOrder.likedPage(0, 30, ownUid, ownSecUid);
+                List<String> stuck = new ArrayList<>();
+                for (String id : ids) if (p.ids.contains(id)) stuck.add(id);
+                if (stuck.size() < ids.size()) return null;      // at least some went: it works
+                if (attempt == 1) return android.text.TextUtils.join(",", stuck);
+            }
+        } catch (Exception e) {
+            Cleancut.favLog("likes check: " + e.getMessage());
+        }
+        return null;     // couldn't check: carry on (each reply was a yes)
+    }
+
     private static int targetLeft(Kind k) {
         SharedPreferences p = prefs();
         return p == null ? 0 : p.getInt(k.key + "_target", 0);
@@ -540,14 +577,15 @@ public final class FavoritesTools {
     }
 
     /**
-     * TikTok's own "remove unavailable videos" (its banner's request), across all your favourites:
-     * it looks at the favourites saved before the cursor it's given, so it's asked from now and
-     * then from the start of every month back to 2016, a second apart.
+     * TikTok's own "remove unavailable videos" (its banner's request: a form POST of one field,
+     * cursor, the save time it last found unavailable ones at). Asked with 0 and now first, then
+     * from the start of every month back to 2016, a second apart, adding up what TikTok removed.
      */
     private static void removeUnavailable() {
         work("Removing unavailable favourite videos (about 2 minutes)…", () -> {
             List<Long> cursors = new ArrayList<>();
             cursors.add(0L);
+            cursors.add(System.currentTimeMillis() / 1000);
             Calendar c = Calendar.getInstance();
             c.set(Calendar.DAY_OF_MONTH, 1);
             c.set(Calendar.HOUR_OF_DAY, 0);
@@ -561,7 +599,7 @@ public final class FavoritesTools {
             Set<String> gone = new HashSet<>();
             int asked = 0, refused = 0;
             for (long cursor : cursors) {
-                String raw = post(HOST + "/aweme/v1/aweme/collect/removeinvalid?cursor=" + cursor);
+                String raw = postForm(HOST + "/aweme/v1/aweme/collect/removeinvalid", "cursor=" + cursor);
                 asked++;
                 JSONObject r = new JSONObject(raw);
                 if (r.optInt("status_code", -1) != 0) {
@@ -569,8 +607,10 @@ public final class FavoritesTools {
                     Cleancut.favLog("removeinvalid " + cursor + ": " + raw);
                     if (refused >= 5) break;
                 } else {
-                    JSONArray ids = r.optJSONObject("extra") == null ? null : r.optJSONObject("extra").optJSONArray("fatal_item_ids");
+                    JSONObject extra = r.optJSONObject("extra");
+                    JSONArray ids = extra == null ? null : extra.optJSONArray("fatal_item_ids");
                     if (ids == null) ids = r.optJSONArray("fatal_item_ids");
+                    if (ids == null) ids = r.optJSONArray("invalid_item_ids");
                     if (ids != null) for (int i = 0; i < ids.length(); i++) gone.add(String.valueOf(ids.opt(i)));
                     if (asked <= 3 || ids != null && ids.length() > 0) Cleancut.favLog("removeinvalid " + cursor + ": " + raw);
                 }
@@ -580,9 +620,30 @@ public final class FavoritesTools {
             int n = gone.size();
             Utils.showToastLong(refused >= 5
                     ? "TikTok stopped answering this (removed " + fmt(n) + " so far); try again later."
-                    : n > 0 ? "Done: TikTok removed " + fmt(n) + " unavailable favourite videos. Open Favourites again."
-                    : "TikTok found no unavailable favourite videos. If the count still doesn't match, it may be catching up.");
+                    : "Done. Close and reopen Favourites to see the new count"
+                    + (n > 0 ? " (TikTok reported " + fmt(n) + " removed)." : "."));
         });
+    }
+
+    /** A POST with a form body (field=value&...), through TikTok's own network stack. */
+    private static String postForm(String url, String form) throws Exception {
+        Class<?> utils = Class.forName("com.ss.android.common.util.NetworkUtils");
+        for (Method m : utils.getMethods()) {
+            Class<?>[] p = m.getParameterTypes();
+            if (!m.getName().equals("executePost") || p.length != 5 || p[0] != int.class || p[1] != String.class
+                    || p[2] != byte[].class || p[4] != String.class) continue;
+            try {
+                // No compression (null), as a normal form.
+                return (String) m.invoke(null, 1024 * 1024, url, form.getBytes("UTF-8"), null,
+                        "application/x-www-form-urlencoded");
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof Exception) throw (Exception) cause;
+                throw e;
+            }
+        }
+        // Not found on this version: the parameters in the address instead.
+        return post(url + (url.contains("?") ? "&" : "?") + form);
     }
 
     // --- liked videos -------------------------------------------------------------------------
