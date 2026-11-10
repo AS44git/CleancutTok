@@ -221,37 +221,38 @@ public final class FavoritesOrder {
         return fetchPage(args, cursor, count);
     }
 
+    /** TikTok's tab type for the Liked list (its request goes to /aweme/v1/aweme/favorite/). */
+    private static final int LIKED = 1;
+
     /**
-     * Your liked videos, newest first, through TikTok's own request for the Liked tab. Which tab
-     * that is gets found once: of the tabs of your own profile opened recently (not Favourites), the
-     * one whose videos all say you've liked them.
+     * Your liked videos, newest first: TikTok's own profile-list request for tab 1 (the Liked list,
+     * /aweme/v1/aweme/favorite/ with max_cursor), made from your own profile's request for another
+     * tab with only the tab changed. (On this TikTok the Liked tab loads another way, so its own
+     * request never comes by to be copied.)
      */
     static Page likedPage(long cursor, int count, String uid, String secUid) throws Exception {
         Object[] args = likedArgs;
         if (args == null) {
-            if (fetcher == null) throw new Exception("open your own Liked tab first (scroll it a little), then try again");
-            List<Integer> types = new ArrayList<>(ARGS_BY_TYPE.keySet());
-            types.remove(Integer.valueOf(FAVORITES));
-            Collections.sort(types, (x, y) -> Long.compare(
-                    SEEN_AT.containsKey(y) ? SEEN_AT.get(y) : 0L, SEEN_AT.containsKey(x) ? SEEN_AT.get(x) : 0L));
-            Object[] fallback = null;
-            for (int t : types) {
+            if (fetcher == null) throw new Exception("open your own Favourites tab once first, then try again");
+            Object[] base = null;
+            for (int t : new int[]{LIKED, FAVORITES, 0, 14}) {
                 Object[] a = ARGS_BY_TYPE.get(t);
-                if (a == null || !own(a, uid, secUid)) continue;
-                Page p;
-                try {
-                    p = fetchPage(a, 0, 12);
-                } catch (Exception e) {
-                    continue;
-                }
-                Cleancut.favLog("tab type " + t + " (first page " + FIRST_PAGE.get(t) + "): " + p.ids.size()
-                        + " videos, liked " + p.liked);
-                if (p.ids.isEmpty()) continue;
-                if (p.liked == p.ids.size()) { args = a; break; }
-                if (p.liked < 0 && t != 0 && fallback == null) fallback = a;   // can't tell: most recent other tab
+                if (a != null && Boolean.TRUE.equals(FIRST_PAGE.get(t)) && own(a, uid, secUid)) { base = a; break; }
             }
-            if (args == null) args = fallback;
-            if (args == null) throw new Exception("open your own Liked tab first (scroll it a little), then try again");
+            if (base == null) throw new Exception("open your own Favourites tab once first (it lends its request), then try again");
+            args = base.clone();
+            args[0] = false;        // not from cache
+            args[3] = LIKED;
+            args[8] = 0;            // hotsoon_filtered_count
+            args[9] = 0;            // hotsoon_has_more
+            args[12] = false;       // not "locate this video"
+            args[13] = "";
+            if (args[1] == null || String.valueOf(args[1]).isEmpty()) args[1] = uid;
+            if (args[2] == null || String.valueOf(args[2]).isEmpty()) args[2] = secUid;
+            Page p = fetchPage(args, 0, 12);
+            Cleancut.favLog("liked list (tab " + LIKED + " from tab " + base[3] + "): " + p.ids.size()
+                    + " videos, liked " + p.liked + ", more " + p.more);
+            if (p.ids.isEmpty()) throw new Exception("TikTok sent an empty Liked list (details saved for Claude)");
             likedArgs = args;
         }
         return fetchPage(args, cursor, count);

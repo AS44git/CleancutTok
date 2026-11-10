@@ -145,6 +145,27 @@ jobs:
           EOF
           ls -l dist
 
+      # The same key every time (yours, when the repository has it), so a new test build installs
+      # over the last one as an update instead of needing an uninstall.
+      - name: Sign with your key, if the repository has it
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KEY_PASS: ${{ secrets.KEY_PASS || secrets.KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASS" ]; then echo "no keystore: left as is"; exit 0; fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/k.keystore"
+          alias="$KEY_ALIAS"
+          [ -n "$alias" ] || alias="$(keytool -list -v -keystore "$RUNNER_TEMP/k.keystore" -storepass "$KEYSTORE_PASS" | sed -n 's/^Alias name: //p' | head -1)"
+          apksigner="$(ls -t "$ANDROID_HOME"/build-tools/*/apksigner | head -1)"
+          for f in dist/*.apk; do
+            "$apksigner" sign --ks "$RUNNER_TEMP/k.keystore" --ks-key-alias "$alias" \
+              --ks-pass env:KEYSTORE_PASS --key-pass env:KEY_PASS "$f"
+            "$apksigner" verify --print-certs "$f" | grep -m1 "SHA-256"
+          done
+          rm -f "$RUNNER_TEMP/k.keystore" dist/*.idsig
+
       - uses: actions/upload-artifact@v4
         with:
           name: debug-apk

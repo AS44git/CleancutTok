@@ -539,15 +539,49 @@ public final class FavoritesTools {
         if (p != null) p.edit().putLong(k.key + "_rest", until).apply();
     }
 
+    /**
+     * TikTok's own "remove unavailable videos" (its banner's request), across all your favourites:
+     * it looks at the favourites saved before the cursor it's given, so it's asked from now and
+     * then from the start of every month back to 2016, a second apart.
+     */
     private static void removeUnavailable() {
-        work("Removing unavailable favourite videos…", () -> {
-            String raw = post(HOST + "/aweme/v1/aweme/collect/removeinvalid?cursor=0");
-            JSONObject r = new JSONObject(raw);
-            int code = r.optInt("status_code", -1);
-            Cleancut.favLog("removeinvalid: " + raw);
-            Utils.showToastLong(code == 0
-                    ? "Done: TikTok removed your unavailable favourite videos. Open Favourites again to see the new count."
-                    : "TikTok didn't do it: " + r.optString("status_msg", "status " + code));
+        work("Removing unavailable favourite videos (about 2 minutes)…", () -> {
+            List<Long> cursors = new ArrayList<>();
+            cursors.add(0L);
+            Calendar c = Calendar.getInstance();
+            c.set(Calendar.DAY_OF_MONTH, 1);
+            c.set(Calendar.HOUR_OF_DAY, 0);
+            c.set(Calendar.MINUTE, 0);
+            c.set(Calendar.SECOND, 0);
+            c.set(Calendar.MILLISECOND, 0);
+            while (c.get(Calendar.YEAR) >= 2016) {
+                cursors.add(c.getTimeInMillis() / 1000);
+                c.add(Calendar.MONTH, -1);
+            }
+            Set<String> gone = new HashSet<>();
+            int asked = 0, refused = 0;
+            for (long cursor : cursors) {
+                String raw = post(HOST + "/aweme/v1/aweme/collect/removeinvalid?cursor=" + cursor);
+                asked++;
+                JSONObject r = new JSONObject(raw);
+                if (r.optInt("status_code", -1) != 0) {
+                    refused++;
+                    Cleancut.favLog("removeinvalid " + cursor + ": " + raw);
+                    if (refused >= 5) break;
+                } else {
+                    JSONArray ids = r.optJSONObject("extra") == null ? null : r.optJSONObject("extra").optJSONArray("fatal_item_ids");
+                    if (ids == null) ids = r.optJSONArray("fatal_item_ids");
+                    if (ids != null) for (int i = 0; i < ids.length(); i++) gone.add(String.valueOf(ids.opt(i)));
+                    if (asked <= 3 || ids != null && ids.length() > 0) Cleancut.favLog("removeinvalid " + cursor + ": " + raw);
+                }
+                if (asked % 30 == 0) Utils.showToastShort("Checking for unavailable videos… " + (asked * 100 / cursors.size()) + "%");
+                sleep(900 + RANDOM.nextInt(400));
+            }
+            int n = gone.size();
+            Utils.showToastLong(refused >= 5
+                    ? "TikTok stopped answering this (removed " + fmt(n) + " so far); try again later."
+                    : n > 0 ? "Done: TikTok removed " + fmt(n) + " unavailable favourite videos. Open Favourites again."
+                    : "TikTok found no unavailable favourite videos. If the count still doesn't match, it may be catching up.");
         });
     }
 
