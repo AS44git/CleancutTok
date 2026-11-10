@@ -323,6 +323,7 @@ public final class FavoritesTools {
         AlertDialog.Builder b = new AlertDialog.Builder(activity)
                 .setTitle(title)
                 .setPositiveButton("Remove", (d, w) -> {
+                    ToolNotice.askPermission(activity);
                     savePending(k, ids);
                     saveTarget(k, k == Kind.LIKES ? Math.max(ids.size(), likesWanted) : ids.size());
                     work(null, () -> removeAll(k));
@@ -345,7 +346,7 @@ public final class FavoritesTools {
         Set<String> done = new HashSet<>();
         int allowance = k.daily - doneToday(k);
         if (allowance <= 0) {
-            Utils.showToastLong("Today's limit of " + fmt(k.daily) + " " + k.noun + " is reached. "
+            ended(k, "Today's limit of " + fmt(k.daily) + " " + k.noun + " is reached. "
                     + fmt(left.size()) + " left: long-press Posts tomorrow to continue.");
             return;
         }
@@ -357,7 +358,9 @@ public final class FavoritesTools {
         int noAnswer = 0;
         List<String> firstDone = new ArrayList<>();
         boolean checked = k != Kind.LIKES;
-        Utils.showToastLong("Removing " + fmt(total) + " " + k.noun + "…");
+        Utils.showToastLong("Removing " + fmt(total) + " " + k.noun + "… (progress in your notifications)");
+        String title = "Removing " + k.noun;
+        ToolNotice.note(title, "Starting: 0 of " + fmt(total), 0, total);
         while (true) {
             if (left.isEmpty()) {
                 if (k != Kind.LIKES || removed >= target) break;
@@ -369,7 +372,7 @@ public final class FavoritesTools {
             if (removed >= allowance) {
                 savePending(k, left);
                 saveTarget(k, target - removed);
-                Utils.showToastLong("Removed " + fmt(removed) + " " + k.noun + ": today's limit. "
+                ended(k, "Removed " + fmt(removed) + " " + k.noun + ": today's limit. "
                         + fmt(k == Kind.LIKES ? target - removed : left.size()) + " left: long-press Posts tomorrow to continue.");
                 return;
             }
@@ -408,11 +411,15 @@ public final class FavoritesTools {
             }
             if (offline) {
                 if (++noAnswer == 1) Cleancut.favLog("no answer, waiting: " + why);
-                if (noAnswer % 6 == 1) Utils.showToastShort("No connection, waiting for it to come back…");
+                if (noAnswer % 6 == 1) {
+                    Utils.showToastShort("No connection, waiting for it to come back…");
+                    ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · No connection, waiting for it to come back…",
+                            removed, total);
+                }
                 if (noAnswer >= 180) {     // half an hour with no answer: stop, keep the place
                     savePending(k, left);
                     saveTarget(k, target - removed);
-                    Utils.showToastLong("Stopped after " + fmt(removed) + ": no connection for half an hour. "
+                    ended(k, "Stopped after " + fmt(removed) + ": no connection for half an hour. "
                             + "Long-press Posts to continue.");
                     return;
                 }
@@ -435,13 +442,15 @@ public final class FavoritesTools {
                         savePending(k, left);
                         saveTarget(k, target - removed);
                         Cleancut.favLog("likes said removed but still in the Liked list: " + stuck);
-                        Utils.showToastLong("Stopped: TikTok said yes but those likes are still there. Nothing else was "
+                        ended(k, "Stopped: TikTok said yes but those likes are still there. Nothing else was "
                                 + "touched; the details are in cleancut-favourites.txt for Claude.");
                         return;
                     }
                 }
                 if (removed % 10 == 0) savePending(k, left);
                 if (removed % 50 == 0) Utils.showToastShort("Removed " + fmt(removed) + " of " + fmt(total) + " " + k.noun + "…");
+                ToolNotice.progress(title, fmt(removed) + " of " + fmt(total) + " · about "
+                        + minutes(k, Math.max(0, total - removed)) + " left", removed, total);
                 sleep(k.every + RANDOM.nextInt(600));
                 continue;
             }
@@ -456,20 +465,24 @@ public final class FavoritesTools {
                 // Refused from the very first one: not TikTok slowing things down, something's wrong.
                 savePending(k, left);
                 saveTarget(k, target);
-                Utils.showToastLong("TikTok refused every one (" + why + "), so nothing was removed. "
+                ended(k, "TikTok refused every one (" + why + "), so nothing was removed. "
                         + "The details are in cleancut-favourites.txt for Claude.");
                 return;
             } else if (inARow >= 9) {
                 savePending(k, left);
                 saveTarget(k, target - removed);
-                Utils.showToastLong("Stopped after " + fmt(removed) + " (TikTok: " + why + "). "
+                ended(k, "Stopped after " + fmt(removed) + " (TikTok: " + why + "). "
                         + "Long-press Posts to continue whenever you like.");
                 return;
             } else if (inARow == 6) {
                 Utils.showToastLong("TikTok is still saying no, waiting 5 minutes… (" + why + ")");
+                ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · TikTok is saying no, waiting 5 minutes…",
+                        removed, total);
                 sleep(300_000);
             } else if (inARow == 3) {
                 Utils.showToastLong("TikTok is slowing things down, waiting a minute… (" + why + ")");
+                ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · TikTok is slowing things down, waiting a minute…",
+                        removed, total);
                 sleep(60_000);
             } else {
                 sleep(4_000);
@@ -477,7 +490,7 @@ public final class FavoritesTools {
         }
         savePending(k, left);
         saveTarget(k, 0);
-        Utils.showToastLong("Done: removed " + fmt(removed) + " " + k.noun + ". Open the tab again to see the new count.");
+        ended(k, "Done: removed " + fmt(removed) + " " + k.noun + ". Open the tab again to see the new count.");
     }
 
     private static String minutes(Kind k, int n) {
@@ -529,6 +542,16 @@ public final class FavoritesTools {
             Cleancut.favLog("likes check: " + e.getMessage());
         }
         return null;     // couldn't check: carry on (each reply was a yes)
+    }
+
+    /** A toast now and the notification: for when the run ends. */
+    private static void ended(Kind k, String msg) {
+        Utils.showToastLong(msg);
+        ToolNotice.finish(cap(k.noun) + ": " + (msg.startsWith("Done") ? "done" : "stopped"), msg);
+    }
+
+    private static String cap(String s) {
+        return s.isEmpty() ? s : Character.toUpperCase(s.charAt(0)) + s.substring(1);
     }
 
     private static int targetLeft(Kind k) {
@@ -618,9 +641,16 @@ public final class FavoritesTools {
                     if (asked <= 3 || ids != null && ids.length() > 0) Cleancut.favLog("removeinvalid " + cursor + ": " + raw);
                 }
                 if (asked % 30 == 0) Utils.showToastShort("Checking for unavailable videos… " + (asked * 100 / cursors.size()) + "%");
+                ToolNotice.progress("Removing unavailable favourites", "Checking month " + asked + " of " + cursors.size(),
+                        asked, cursors.size());
                 sleep(900 + RANDOM.nextInt(400));
             }
             int n = gone.size();
+            String endMsg = refused >= 5
+                    ? "TikTok stopped answering this (removed " + fmt(n) + " so far); try again later."
+                    : "Done. Close and reopen Favourites to see the new count"
+                    + (n > 0 ? " (TikTok reported " + fmt(n) + " removed)." : ".");
+            ToolNotice.finish("Unavailable favourites: " + (refused >= 5 ? "stopped" : "done"), endMsg);
             Utils.showToastLong(refused >= 5
                     ? "TikTok stopped answering this (removed " + fmt(n) + " so far); try again later."
                     : "Done. Close and reopen Favourites to see the new count"
