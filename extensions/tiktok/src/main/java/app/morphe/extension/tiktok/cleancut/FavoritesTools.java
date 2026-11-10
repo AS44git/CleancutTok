@@ -61,7 +61,7 @@ public final class FavoritesTools {
     /** What a run removes, and how gently. */
     private enum Kind {
         FAVOURITES("favourites", "remove_pending", 1500, 1200, false),
-        LIKES("likes", "likes_pending", 1000, 1600, true);
+        LIKES("likes", "likes_pending", 2000, 1600, true);
 
         final String noun;
         final String key;
@@ -320,12 +320,6 @@ public final class FavoritesTools {
         }
         Activity activity = Utils.getVisibleActivity();
         if (activity == null) return;
-        long until = pausedUntil(k);
-        if (until > System.currentTimeMillis()) {
-            Utils.showToastLong("TikTok asked to slow down earlier: " + k.noun + " can be removed again after "
-                    + new SimpleDateFormat("EEE HH:mm", Locale.getDefault()).format(new Date(until)) + ".");
-            return;
-        }
         AlertDialog.Builder b = new AlertDialog.Builder(activity)
                 .setTitle(title)
                 .setPositiveButton("Remove", (d, w) -> {
@@ -360,6 +354,7 @@ public final class FavoritesTools {
         int inARow = 0;
         boolean usePost = k.post, triedPost = k.post;
         Map<String, Integer> tries = new HashMap<>();
+        int noAnswer = 0;
         List<String> firstDone = new ArrayList<>();
         boolean checked = k != Kind.LIKES;
         Utils.showToastLong("Removing " + fmt(total) + " " + k.noun + "…");
@@ -380,10 +375,16 @@ public final class FavoritesTools {
             }
             String id = left.get(0);
             String why;
+            boolean offline = false;
             try {
                 String url = k.url(id);
                 String raw = usePost ? post(url) : get(url);
-                JSONObject r = new JSONObject(raw);
+                JSONObject r;
+                try {
+                    r = new JSONObject(raw);
+                } catch (Exception notJson) {
+                    throw new java.io.IOException("not TikTok's answer (" + String.valueOf(raw).length() + " chars)");
+                }
                 int code = r.optInt("status_code", -1);
                 if (code != 0 && !triedPost) {
                     // Not the way that worked so far: try the other (GET/POST) once, keep what works.
@@ -401,8 +402,24 @@ public final class FavoritesTools {
                 String msg = r.optString("status_msg", "");
                 why = code == 0 ? null : (msg.isEmpty() ? "status " + code : msg);
             } catch (Throwable t) {
+                // No answer at all (no signal, screen off, the app paused): not TikTok saying no.
                 why = String.valueOf(t.getMessage());
+                offline = true;
             }
+            if (offline) {
+                if (++noAnswer == 1) Cleancut.favLog("no answer, waiting: " + why);
+                if (noAnswer % 6 == 1) Utils.showToastShort("No connection, waiting for it to come back…");
+                if (noAnswer >= 180) {     // half an hour with no answer: stop, keep the place
+                    savePending(k, left);
+                    saveTarget(k, target - removed);
+                    Utils.showToastLong("Stopped after " + fmt(removed) + ": no connection for half an hour. "
+                            + "Long-press Posts to continue.");
+                    return;
+                }
+                sleep(10_000);
+                continue;
+            }
+            noAnswer = 0;
             if (why == null) {
                 left.remove(0);
                 done.add(id);
@@ -442,13 +459,15 @@ public final class FavoritesTools {
                 Utils.showToastLong("TikTok refused every one (" + why + "), so nothing was removed. "
                         + "The details are in cleancut-favourites.txt for Claude.");
                 return;
-            } else if (inARow >= 6) {
-                pauseUntilTomorrow(k);
+            } else if (inARow >= 9) {
                 savePending(k, left);
                 saveTarget(k, target - removed);
-                Utils.showToastLong("Stopped after " + fmt(removed) + " (TikTok: " + why + "). Resting until tomorrow; "
-                        + fmt(left.size()) + " left: long-press Posts then to continue.");
+                Utils.showToastLong("Stopped after " + fmt(removed) + " (TikTok: " + why + "). "
+                        + "Long-press Posts to continue whenever you like.");
                 return;
+            } else if (inARow == 6) {
+                Utils.showToastLong("TikTok is still saying no, waiting 5 minutes… (" + why + ")");
+                sleep(300_000);
             } else if (inARow == 3) {
                 Utils.showToastLong("TikTok is slowing things down, waiting a minute… (" + why + ")");
                 sleep(60_000);
@@ -559,22 +578,6 @@ public final class FavoritesTools {
         p.edit().putString(k.key + "_day", today()).putInt(k.key + "_today", doneToday(k) + 1).apply();
     }
 
-    private static long pausedUntil(Kind k) {
-        SharedPreferences p = prefs();
-        return p == null ? 0 : p.getLong(k.key + "_rest", 0);
-    }
-
-    /** Until 6 in the morning after next midnight, and at least 8 hours. */
-    private static void pauseUntilTomorrow(Kind k) {
-        Calendar c = Calendar.getInstance();
-        c.add(Calendar.DAY_OF_YEAR, 1);
-        c.set(Calendar.HOUR_OF_DAY, 6);
-        c.set(Calendar.MINUTE, 0);
-        c.set(Calendar.SECOND, 0);
-        long until = Math.max(c.getTimeInMillis(), System.currentTimeMillis() + 8 * 3600_000L);
-        SharedPreferences p = prefs();
-        if (p != null) p.edit().putLong(k.key + "_rest", until).apply();
-    }
 
     /**
      * TikTok's own "remove unavailable videos" (its banner's request: a form POST of one field,
