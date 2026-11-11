@@ -118,6 +118,8 @@ public final class FavoritesTools {
         actions.add(FavoritesTools::pickOldest);
         labels.add("Favourites: remove unavailable videos");
         actions.add(FavoritesTools::removeUnavailable);
+        labels.add("Favourites: flush out hidden ones (the last few that won't show)");
+        actions.add(FavoritesTools::flushHidden);
         labels.add("Liked: remove my most recent likes…");
         actions.add(FavoritesTools::pickLikes);
         labels.add("Liked: count my liked videos");
@@ -709,6 +711,57 @@ public final class FavoritesTools {
         }
         // Not found on this version: the parameters in the address instead.
         return post(url + (url.contains("?") ? "&" : "?") + form);
+    }
+
+    /**
+     * The favourites TikTok counts but won't show (deleted or private videos): its replies to the
+     * Favourites request carry their ids on the side (invalidItemIdList), for its banner. The whole
+     * list is read, newest to oldest, those ids gathered, and they're removed one at a time like
+     * any other favourite, as with the hidden sounds and effects.
+     */
+    private static void flushHidden() {
+        work("Looking through all your favourites for hidden ones…", () -> {
+            knowMe();
+            Set<String> hidden = new java.util.LinkedHashSet<>();
+            Set<String> shown = new java.util.LinkedHashSet<>();
+            long cursor = 0;
+            int pages = 0;
+            String info = "";
+            for (; pages < 400; pages++) {
+                FavoritesOrder.Page p = page(cursor, 30);
+                hidden.addAll(p.invalid);
+                shown.addAll(p.ids);
+                if (pages < 3 || !p.invalid.isEmpty()) {
+                    Cleancut.favLog("flush page " + pages + " at " + cursor + ": " + p.ids.size() + " shown, "
+                            + p.invalid.size() + " hidden, counts " + p.invalidInfo + ", more " + p.more + ", next " + p.next);
+                }
+                info = p.invalidInfo;
+                if (!p.more || p.next <= 0 || p.next == cursor) break;
+                cursor = p.next;
+                if (pages % 10 == 9) Utils.showToastShort("Looking through favourites… " + fmt(shown.size() + hidden.size()) + " so far");
+            }
+            hidden.removeAll(shown);
+            List<String> ids = new ArrayList<>(hidden);
+            ids.addAll(shown);       // any still showing go too: this is for clearing out the very last
+            Cleancut.favLog("flush: " + hidden.size() + " hidden, " + shown.size() + " shown, after " + (pages + 1) + " pages");
+            final String last = info;
+            Utils.runOnMainThread(() -> {
+                if (ids.isEmpty()) {
+                    Activity activity = Utils.getVisibleActivity();
+                    if (activity == null) return;
+                    new AlertDialog.Builder(activity)
+                            .setTitle("No hidden favourites handed over")
+                            .setMessage("TikTok's replies didn't include the hidden ones this time (its counts: " + last
+                                    + "). The details are in cleancut-favourites.txt for Claude.")
+                            .setPositiveButton("OK", null)
+                            .show();
+                    return;
+                }
+                confirmRemove(Kind.FAVOURITES, ids,
+                        "Remove " + fmt(ids.size()) + " favourites (" + fmt(hidden.size()) + " hidden, " + fmt(shown.size()) + " showing)?",
+                        plan(Kind.FAVOURITES, ids.size()));
+            });
+        });
     }
 
     // --- liked videos -------------------------------------------------------------------------

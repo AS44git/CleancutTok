@@ -186,6 +186,10 @@ public final class FavoritesOrder {
         final boolean more;
         /** How many of the page's videos say you've liked them; -1 if TikTok's model doesn't say. */
         final int liked;
+        /** Ids TikTok lists as unavailable (deleted, private) next to the page: kept out of view. */
+        final List<String> invalid = new ArrayList<>();
+        /** TikTok's own counts of unavailable ones, for the notes: invalidItemCount/invalidCount/hiding. */
+        String invalidInfo = "";
 
         Page(List<String> ids, long next, boolean more, int liked) {
             this.ids = ids;
@@ -290,7 +294,18 @@ public final class FavoritesOrder {
         } catch (Throwable t) {
             throw new Exception("couldn't read TikTok's page: " + t);
         }
-        return new Page(ids, nextCursor(r), hasMore(r), known ? liked : -1);
+        Page page = new Page(ids, nextCursor(r), hasMore(r), known ? liked : -1);
+        try {
+            Object list = invoke(r, "getInvalidItemIdList");
+            if (list instanceof List) {
+                for (Object o : (List<?>) list) if (o != null && !String.valueOf(o).isEmpty()) page.invalid.add(String.valueOf(o));
+            }
+            page.invalidInfo = invoke(r, "getInvalidItemCount") + "/" + invoke(r, "getInvalidCount") + "/"
+                    + invoke(r, "getHidingInvalidItem") + "/" + invoke(r, "getIsClearInvalidItem");
+        } catch (Throwable ignored) {
+            // older models: no such fields
+        }
+        return page;
     }
 
     /** 1 if you've liked this video, 0 if not, -1 if TikTok's model doesn't say. */
