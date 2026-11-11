@@ -61,7 +61,7 @@ public final class FavoritesTools {
     /** What a run removes, and how gently. */
     private enum Kind {
         FAVOURITES("favourites", "remove_pending", 1500, 1200, false),
-        LIKES("likes", "likes_pending", 2000, 1600, true);
+        LIKES("likes", "likes_pending", 6000, 1600, true);
 
         final String noun;
         final String key;
@@ -179,8 +179,8 @@ public final class FavoritesTools {
     private static void pickLikes() {
         Activity activity = Utils.getVisibleActivity();
         if (activity == null) return;
-        String[] choices = {"100", "250", "500", "1,000 (a day's limit)"};
-        int[] amounts = {100, 250, 500, 1000};
+        String[] choices = {"100", "250", "500", "1,000", "2,000", "5,000"};
+        int[] amounts = {100, 250, 500, 1000, 2000, 5000};
         new AlertDialog.Builder(activity)
                 .setTitle("Remove my most recent likes…")
                 .setItems(choices, (d, which) -> {
