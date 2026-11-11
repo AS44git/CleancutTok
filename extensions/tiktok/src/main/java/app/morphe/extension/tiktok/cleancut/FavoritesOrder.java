@@ -251,8 +251,10 @@ public final class FavoritesOrder {
             if (args[2] == null || String.valueOf(args[2]).isEmpty()) args[2] = secUid;
             Page p = fetchPage(args, 0, 12);
             Cleancut.favLog("liked list (tab " + LIKED + " from tab " + base[3] + "): " + p.ids.size()
-                    + " videos, liked " + p.liked + ", more " + p.more);
-            if (p.ids.isEmpty()) throw new Exception("TikTok sent an empty Liked list (details saved for Claude)");
+                    + " videos, liked " + p.liked + ", more " + p.more + ", next " + p.next);
+            // An empty first page with more after it is normal after many removals: the ones just
+            // unliked still sit at the top of TikTok's list, hidden.
+            if (p.ids.isEmpty() && !p.more) throw new Exception("TikTok sent an empty Liked list (details saved for Claude)");
             likedArgs = args;
         }
         return fetchPage(args, cursor, count);

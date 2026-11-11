@@ -274,15 +274,19 @@ public final class FavoritesTools {
         List<String> out = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         long cursor = 0;
-        for (int page = 0; page < 200 && out.size() < n; page++) {
+        int empty = 0;
+        for (int page = 0; page < 300 && out.size() < n; page++) {
             FavoritesOrder.Page p = FavoritesOrder.likedPage(cursor, 30, ownUid, ownSecUid);
             sleep(300);
             int added = 0;
             for (String id : p.ids) if (seen.add(id)) { out.add(id); added++; }
-            if (!p.more || p.next <= 0 || p.next == cursor || added == 0) break;
+            // Empty pages (likes just removed, hidden) are skipped past while TikTok says there's more.
+            empty = added == 0 ? empty + 1 : 0;
+            if (!p.more || p.next <= 0 || p.next == cursor || empty >= 120) break;
             cursor = p.next;
             if (page % 10 == 9) Utils.showToastShort("Finding likes… " + fmt(out.size()) + " so far");
         }
+        Cleancut.favLog("found " + out.size() + " likes (pages read up to cursor " + cursor + ")");
         return out.size() > n ? new ArrayList<>(out.subList(0, n)) : out;
     }
 
@@ -339,7 +343,33 @@ public final class FavoritesTools {
      * three tries (it may be gone). Several refusals in a row mean TikTok wants it slower: a
      * minute's wait, then, if it goes on, a stop until tomorrow. What's left stays pending.
      */
+    /**
+     * TikTok drops its own requests a minute after it leaves the screen ("went background"), and the
+     * screen turning off counts: so while a run goes, the screen stays on (dim it if you like).
+     */
+    private static void keepScreenOn(boolean on) {
+        Utils.runOnMainThread(() -> {
+            try {
+                Activity a = Utils.getVisibleActivity();
+                if (a == null) return;
+                if (on) a.getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                else a.getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            } catch (Throwable ignored) {
+                // best effort
+            }
+        });
+    }
+
     private static void removeAll(Kind k) {
+        keepScreenOn(true);
+        try {
+            removeAllOn(k);
+        } finally {
+            keepScreenOn(false);
+        }
+    }
+
+    private static void removeAllOn(Kind k) {
         List<String> left = new ArrayList<>(pending(k));
         // Likes: the target count; as the found ones go, the Liked list's top is read again.
         int target = k == Kind.LIKES ? Math.max(left.size(), targetLeft(k)) : left.size();
@@ -412,9 +442,10 @@ public final class FavoritesTools {
             if (offline) {
                 if (++noAnswer == 1) Cleancut.favLog("no answer, waiting: " + why);
                 if (noAnswer % 6 == 1) {
-                    Utils.showToastShort("No connection, waiting for it to come back…");
-                    ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · No connection, waiting for it to come back…",
-                            removed, total);
+                    boolean away = String.valueOf(why).contains("background");
+                    String wait = away ? "Paused: open the TT test again to carry on" : "No connection, waiting for it to come back…";
+                    Utils.showToastShort(wait);
+                    ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · " + wait, removed, total);
                 }
                 if (noAnswer >= 180) {     // half an hour with no answer: stop, keep the place
                     savePending(k, left);
@@ -570,12 +601,13 @@ public final class FavoritesTools {
         try {
             knowMe();
             long cursor = 0;
-            for (int page = 0; page < 3 && out.size() < want; page++) {
+            for (int page = 0; page < 120 && out.size() < want; page++) {
                 FavoritesOrder.Page p = FavoritesOrder.likedPage(cursor, 30, ownUid, ownSecUid);
-                sleep(400);
+                sleep(300);
                 for (String id : p.ids) if (!done.contains(id) && !out.contains(id)) out.add(id);
                 if (!out.isEmpty() || !p.more || p.next <= 0 || p.next == cursor) break;
-                cursor = p.next;    // the top was all done already (TikTok catching up): look further
+                cursor = p.next;    // the top is all done or hidden (TikTok catching up): look further
+                if (page % 10 == 9) ToolNotice.progress("Removing likes", "Looking further down your likes…", 0, 0);
             }
         } catch (Exception e) {
             Cleancut.favLog("likes refill: " + e.getMessage());
