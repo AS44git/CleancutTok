@@ -149,6 +149,7 @@ public final class FavoritesTools {
                     work("Counting your favourites from " + year + "…", () -> {
                         List<String> ids = listBetween(startOfYear(year + 1), startOfYear(year), "from " + year);
                         Collections.reverse(ids);      // oldest first
+                        ToolNotice.clear();
                         Utils.runOnMainThread(() -> confirmRemove(Kind.FAVOURITES, ids,
                                 "Remove " + fmt(ids.size()) + " favourites saved in " + year + "?",
                                 "Oldest first. " + plan(Kind.FAVOURITES, ids.size())));
@@ -168,6 +169,7 @@ public final class FavoritesTools {
                     int n = amounts[which];
                     work("Finding your oldest " + fmt(n) + " favourites…", () -> {
                         List<String> ids = oldest(n);
+                        ToolNotice.clear();
                         Utils.runOnMainThread(() -> confirmRemove(Kind.FAVOURITES, ids,
                                 "Remove your oldest " + fmt(ids.size()) + " favourites?",
                                 "Oldest first. " + plan(Kind.FAVOURITES, ids.size())));
@@ -186,12 +188,22 @@ public final class FavoritesTools {
                 .setItems(choices, (d, which) -> {
                     int n = amounts[which];
                     likesWanted = n;
-                    work("Finding your " + fmt(n) + " most recent likes…", () -> {
-                        List<String> ids = recentLikes(n);
-                        Utils.runOnMainThread(() -> confirmRemove(Kind.LIKES, ids,
-                                "Unlike your " + fmt(Math.max(ids.size(), n)) + " most recent liked videos?",
-                                "Newest first (TikTok only lists your recent likes; older ones show up as these go). "
-                                        + plan(Kind.LIKES, ids.size())));
+                    work("Finding your " + fmt(n) + " most recent likes… (progress in your notifications)", () -> {
+                        LikesScan scan = scanLikes(n, new HashSet<>(), true,
+                                (t, f, w) -> ToolNotice.scan("Finding your likes", t, f, w));
+                        ToolNotice.clear();
+                        Utils.runOnMainThread(() -> {
+                            if (scan.ids.isEmpty()) {
+                                showNoLikes(scan);
+                                return;
+                            }
+                            confirmRemove(Kind.LIKES, scan.ids,
+                                    "Unlike your " + fmt(Math.max(scan.ids.size(), n)) + " most recent liked videos?",
+                                    "Found " + fmt(scan.ids.size()) + " to start with"
+                                            + (scan.total >= 0 ? " (TikTok says you have " + fmt(scan.total) + " likes in all)" : "")
+                                            + ". Newest first; TikTok lists your likes in stretches, so the rest are read from your list as these go. "
+                                            + plan(Kind.LIKES, Math.max(scan.ids.size(), n)));
+                        });
                     });
                 })
                 .show();
@@ -236,6 +248,7 @@ public final class FavoritesTools {
                 }
                 break;
             }
+            ToolNotice.scan("Finding favourites", fmt(out.size()) + " found " + what + " · page " + (page + 1), out.size(), 0);
             if (page % 10 == 9) Utils.showToastShort("Counting favourites " + what + "… " + fmt(out.size()) + " so far");
         }
         return out;
@@ -270,26 +283,202 @@ public final class FavoritesTools {
         ownSecUid = user.optString("sec_uid", "");
     }
 
-    /** Your n most recent likes, newest first, through TikTok's own Liked tab request. */
-    private static List<String> recentLikes(int n) throws Exception {
-        knowMe();
-        List<String> out = new ArrayList<>();
-        Set<String> seen = new HashSet<>();
-        long cursor = 0;
-        int empty = 0;
-        for (int page = 0; page < 300 && out.size() < n; page++) {
-            FavoritesOrder.Page p = FavoritesOrder.likedPage(cursor, 30, ownUid, ownSecUid);
-            sleep(300);
-            int added = 0;
-            for (String id : p.ids) if (seen.add(id)) { out.add(id); added++; }
-            // Empty pages (likes just removed, hidden) are skipped past while TikTok says there's more.
-            empty = added == 0 ? empty + 1 : 0;
-            if (!p.more || p.next <= 0 || p.next == cursor || empty >= 120) break;
-            cursor = p.next;
-            if (page % 10 == 9) Utils.showToastShort("Finding likes… " + fmt(out.size()) + " so far");
+    /** What looking through the Liked list found, and what TikTok said while it did. */
+    private static final class LikesScan {
+        final List<String> ids = new ArrayList<>();
+        int pages, emptyPages, errors, restarts;
+        /** Your like count, from your profile (-1 if it didn't say). */
+        long total = -1;
+        String last = "", how = "", direct = "";
+
+        String report() {
+            StringBuilder b = new StringBuilder();
+            if (total >= 0) b.append("TikTok says you have ").append(fmt(total)).append(" likes.\n");
+            b.append("Pages read: ").append(pages).append(" (").append(emptyPages).append(" empty)");
+            if (errors > 0) b.append(", failed requests: ").append(errors);
+            b.append(".\nLast reply: ").append(last.isEmpty() ? "none" : last).append('.');
+            if (restarts > 0) b.append("\nLooked again from the top ").append(restarts).append(restarts == 1 ? " time." : " times.");
+            if (!FavoritesOrder.likedBase.isEmpty()) b.append("\nRequest copied from: ").append(FavoritesOrder.likedBase).append('.');
+            if (!direct.isEmpty()) b.append("\nTikTok's direct list: ").append(direct).append('.');
+            if (!how.isEmpty()) b.append('\n').append(how);
+            return b.toString();
         }
-        Cleancut.favLog("found " + out.size() + " likes (pages read up to cursor " + cursor + ")");
-        return out.size() > n ? new ArrayList<>(out.subList(0, n)) : out;
+    }
+
+    /** Where a search says how it's going. */
+    private interface Tell {
+        void say(String text, int found, int wanted);
+    }
+
+    /**
+     * Your n most recent likes, newest first, through TikTok's own Liked tab request, skipping any in
+     * {@code skip}. Built not to give up early: a page that fails is asked again (a few times), an empty
+     * page with more after it is read past (TikTok keeps just-unliked videos at the top, hidden), an
+     * empty list is asked for again from the top after a pause (another page size, another tab's
+     * request), and, if that finds nothing, TikTok's plain list is tried. It says how it's going the
+     * whole way, and what it found stays found if a later page fails.
+     */
+    private static LikesScan scanLikes(int n, Set<String> skip, boolean first, Tell tell) {
+        LikesScan s = new LikesScan();
+        try {
+            knowMe();
+        } catch (Exception e) {
+            s.how = String.valueOf(e.getMessage());
+            Cleancut.favLog("likes scan: " + e);
+            return s;
+        }
+        if (first) s.total = likesNow();
+        tell.say("Starting…" + (s.total >= 0 ? " You have " + fmt(s.total) + " likes." : ""), 0, n);
+        Set<String> seen = new HashSet<>(skip);
+        long cursor = 0;
+        int count = 30, emptyRun = 0, failures = 0, tried = 0;
+        long deadline = System.currentTimeMillis() + 25 * 60_000L;
+        while (s.ids.size() < n && tried++ < 4000 && System.currentTimeMillis() < deadline) {
+            FavoritesOrder.Page p;
+            try {
+                p = FavoritesOrder.likedPage(cursor, count, ownUid, ownSecUid);
+            } catch (Exception e) {
+                s.errors++;
+                s.last = String.valueOf(e.getMessage());
+                Cleancut.favLog("likes scan, page at " + cursor + ": " + e);
+                if (String.valueOf(e.getMessage()).startsWith("open your own")) {
+                    s.how = String.valueOf(e.getMessage());
+                    break;
+                }
+                if (++failures >= 6) {
+                    s.how = "TikTok kept failing (" + e.getMessage() + ").";
+                    break;
+                }
+                tell.say("TikTok didn't answer, trying again (" + failures + " of 6)…", s.ids.size(), n);
+                sleep(2000L * failures);
+                if (failures == 3) FavoritesOrder.retryLiked(false);
+                continue;
+            }
+            failures = 0;
+            s.pages++;
+            int added = 0;
+            for (String id : p.ids) {
+                if (seen.add(id)) {
+                    s.ids.add(id);
+                    added++;
+                    if (s.ids.size() >= n) break;
+                }
+            }
+            if (p.ids.isEmpty()) s.emptyPages++;
+            emptyRun = added == 0 ? emptyRun + 1 : 0;
+            s.last = "got " + p.ids.size() + ", more " + (p.more ? "yes" : "no") + ", next " + p.next;
+            tell.say(fmt(s.ids.size()) + (n > 0 ? " of " + fmt(n) : "") + " found · page " + s.pages
+                    + (emptyRun >= 5 ? " · reading past likes TikTok is still hiding…" : ""), s.ids.size(), n);
+            if (s.pages % 10 == 0) Utils.showToastShort("Finding likes… " + fmt(s.ids.size()) + " so far");
+            boolean end = !p.more || p.next <= 0 || p.next == cursor;
+            if (end) {
+                if (s.ids.isEmpty() && s.restarts < 3) {
+                    // Nothing at all: TikTok may be catching up. Wait, then look again from the top,
+                    // a little differently each time.
+                    s.restarts++;
+                    tell.say("TikTok's list looks empty, looking again in a few seconds (" + s.restarts + " of 3)…", 0, n);
+                    sleep(4000L * s.restarts);
+                    FavoritesOrder.retryLiked(s.restarts >= 2);
+                    cursor = 0;
+                    emptyRun = 0;
+                    count = new int[]{30, 20, 10, 50}[s.restarts];
+                    continue;
+                }
+                break;
+            }
+            if (emptyRun >= 1500) {
+                s.how = "Read 1,500 pages in a row with no likes in them, so it stopped.";
+                break;
+            }
+            cursor = p.next;
+            sleep(300);
+        }
+        if (s.ids.isEmpty()) {
+            tell.say("Trying TikTok's plain list…", 0, n);
+            directLikes(s, n, seen, tell);
+            if (!s.ids.isEmpty()) s.how = "";
+        }
+        if (s.how.isEmpty() && !s.ids.isEmpty() && s.ids.size() < n) s.how = "That's all TikTok lists right now.";
+        Cleancut.favLog("likes scan: found " + s.ids.size() + " of " + n + ". " + s.report().replace('\n', ' '));
+        return s;
+    }
+
+    /** TikTok's plain Liked list (a signed request of its own), as a last way to find them. */
+    private static void directLikes(LikesScan s, int n, Set<String> seen, Tell tell) {
+        long cursor = 0;
+        for (int guard = 0; guard < 600 && s.ids.size() < n; guard++) {
+            String raw;
+            try {
+                raw = get(HOST + "/aweme/v1/aweme/favorite/?user_id=" + ownUid + "&sec_user_id=" + ownSecUid
+                        + "&max_cursor=" + cursor + "&min_cursor=0&count=30");
+            } catch (Throwable t) {
+                s.direct = "no answer (" + t.getMessage() + ")";
+                return;
+            }
+            JSONObject r;
+            try {
+                r = new JSONObject(raw);
+            } catch (Exception e) {
+                s.direct = "not TikTok's answer";
+                return;
+            }
+            int code = r.optInt("status_code", -1);
+            if (code != 0) {
+                s.direct = "status " + code;
+                Cleancut.favLog("plain likes list: " + raw.substring(0, Math.min(200, raw.length())));
+                return;
+            }
+            List<String> got = ids(r);
+            for (String id : got) {
+                if (seen.add(id)) {
+                    s.ids.add(id);
+                    if (s.ids.size() >= n) break;
+                }
+            }
+            s.direct = got.isEmpty() && s.ids.isEmpty() ? "empty" : "worked";
+            tell.say(fmt(s.ids.size()) + " found · plain list, page " + (guard + 1), s.ids.size(), n);
+            long next = r.optLong("max_cursor", 0);
+            if (r.optInt("has_more", 0) != 1 || next <= 0 || next == cursor) return;
+            cursor = next;
+            sleep(400);
+        }
+    }
+
+    /** Your like count, from your profile; -1 if TikTok doesn't say. */
+    private static long likesNow() {
+        try {
+            JSONObject user = new JSONObject(get(HOST + "/aweme/v1/user/profile/self/")).optJSONObject("user");
+            return user == null ? -1 : user.optLong("favoriting_count", -1);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** The search found no likes: say why in words and numbers, with a button to copy them. */
+    private static void showNoLikes(LikesScan s) {
+        Activity activity = Utils.getVisibleActivity();
+        if (activity == null) {
+            ToolNotice.finish("No likes found", "TikTok isn't listing your likes right now. Open the TT test menu to see why.");
+            return;
+        }
+        String text = s.report();
+        new AlertDialog.Builder(activity)
+                .setTitle("No likes found")
+                .setMessage("TikTok isn't listing any of your liked videos right now.\n\n" + text
+                        + "\n\nTry: close TikTok completely, open it, open your Favourites tab and scroll a little, "
+                        + "then try again. If it's the same, copy these details and send them to Claude.")
+                .setPositiveButton("OK", null)
+                .setNeutralButton("Copy details", (d, w) -> {
+                    try {
+                        android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                                activity.getSystemService(Context.CLIPBOARD_SERVICE);
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("TT test details", text));
+                        Utils.showToastShort("Copied");
+                    } catch (Throwable ignored) {
+                        // nothing to copy to
+                    }
+                })
+                .show();
     }
 
     /**
@@ -325,7 +514,14 @@ public final class FavoritesTools {
             return;
         }
         Activity activity = Utils.getVisibleActivity();
-        if (activity == null) return;
+        if (activity == null) {
+            // TikTok isn't on screen to ask: keep what was found, ready to confirm from the menu.
+            savePending(k, ids);
+            saveTarget(k, k == Kind.LIKES ? Math.max(ids.size(), likesWanted) : ids.size());
+            ToolNotice.finish("Found " + fmt(ids.size()) + " " + k.noun,
+                    "Open TikTok, long-press Posts and choose Continue to remove them.");
+            return;
+        }
         AlertDialog.Builder b = new AlertDialog.Builder(activity)
                 .setTitle(title)
                 .setPositiveButton("Remove", (d, w) -> {
@@ -373,6 +569,7 @@ public final class FavoritesTools {
 
     private static void removeAllOn(Kind k) {
         List<String> left = new ArrayList<>(pending(k));
+        for (java.util.Iterator<String> it = left.iterator(); it.hasNext(); ) if (it.next().isEmpty()) it.remove();   // the "continue" placeholder: likes are read from the list
         // Likes: the target count; as the found ones go, the Liked list's top is read again.
         int target = k == Kind.LIKES ? Math.max(left.size(), targetLeft(k)) : left.size();
         Set<String> done = new HashSet<>();
@@ -388,6 +585,7 @@ public final class FavoritesTools {
         boolean usePost = k.post, triedPost = k.post;
         Map<String, Integer> tries = new HashMap<>();
         int noAnswer = 0;
+        boolean dried = false;
         List<String> firstDone = new ArrayList<>();
         boolean checked = k != Kind.LIKES;
         Utils.showToastLong("Removing " + fmt(total) + " " + k.noun + "… (progress in your notifications)");
@@ -396,8 +594,11 @@ public final class FavoritesTools {
         while (true) {
             if (left.isEmpty()) {
                 if (k != Kind.LIKES || removed >= target) break;
-                List<String> more = refillLikes(done, target - removed);
-                if (more.isEmpty()) break;
+                List<String> more = refillLikes(done, target - removed, removed, total, title);
+                if (more.isEmpty()) {
+                    dried = true;
+                    break;
+                }
                 left.addAll(more);
             }
             if (removed >= target) break;
@@ -521,9 +722,21 @@ public final class FavoritesTools {
                 sleep(4_000);
             }
         }
+        if (dried && removed < target) {
+            // TikTok isn't listing any more right now: keep the place, don't call it done.
+            savePending(k, left);
+            saveTarget(k, target - removed);
+            long now = likesNow();
+            ended(k, "Removed " + fmt(removed) + " " + k.noun + " so far. TikTok isn't listing more of them right now"
+                    + (now >= 0 ? " (it says you have " + fmt(now) + " likes)" : "")
+                    + ": long-press Posts in a few minutes and choose Continue.");
+            return;
+        }
         savePending(k, left);
         saveTarget(k, 0);
-        ended(k, "Done: removed " + fmt(removed) + " " + k.noun + ". Open the tab again to see the new count.");
+        long now = k == Kind.LIKES ? likesNow() : -1;
+        ended(k, "Done: removed " + fmt(removed) + " " + k.noun + "."
+                + (now >= 0 ? " You now have " + fmt(now) + " likes." : " Open the tab again to see the new count."));
     }
 
     private static String minutes(Kind k, int n) {
@@ -597,24 +810,15 @@ public final class FavoritesTools {
         if (p != null) p.edit().putInt(k.key + "_target", Math.max(0, n)).apply();
     }
 
-    /** The newest likes now (the ones just unliked are gone from the top), minus any already done. */
-    private static List<String> refillLikes(Set<String> done, int want) {
-        List<String> out = new ArrayList<>();
-        try {
-            knowMe();
-            long cursor = 0;
-            for (int page = 0; page < 120 && out.size() < want; page++) {
-                FavoritesOrder.Page p = FavoritesOrder.likedPage(cursor, 30, ownUid, ownSecUid);
-                sleep(300);
-                for (String id : p.ids) if (!done.contains(id) && !out.contains(id)) out.add(id);
-                if (!out.isEmpty() || !p.more || p.next <= 0 || p.next == cursor) break;
-                cursor = p.next;    // the top is all done or hidden (TikTok catching up): look further
-                if (page % 10 == 9) ToolNotice.progress("Removing likes", "Looking further down your likes…", 0, 0);
-            }
-        } catch (Exception e) {
-            Cleancut.favLog("likes refill: " + e.getMessage());
-        }
-        return out.size() > want ? new ArrayList<>(out.subList(0, want)) : out;
+    /**
+     * The newest likes now (the ones just unliked sit at the top, hidden), minus any already done, up to
+     * 300 at a time so the top isn't read over and over.
+     */
+    private static List<String> refillLikes(Set<String> done, int want, int removed, int total, String title) {
+        LikesScan s = scanLikes(Math.min(want, 300), done, false, (t, f, w) ->
+                ToolNotice.info(title, fmt(removed) + " of " + fmt(total) + " · " + t, removed, total));
+        Cleancut.favLog("likes refill: " + s.ids.size() + " found");
+        return s.ids;
     }
 
     // --- the day's limit and rests -------------------------------------------------------------
@@ -738,6 +942,8 @@ public final class FavoritesTools {
                 info = p.invalidInfo;
                 if (!p.more || p.next <= 0 || p.next == cursor) break;
                 cursor = p.next;
+                ToolNotice.scan("Looking through favourites", fmt(shown.size() + hidden.size()) + " seen, "
+                        + fmt(hidden.size()) + " hidden · page " + (pages + 1), shown.size() + hidden.size(), 0);
                 if (pages % 10 == 9) Utils.showToastShort("Looking through favourites… " + fmt(shown.size() + hidden.size()) + " so far");
             }
             hidden.removeAll(shown);
@@ -745,6 +951,7 @@ public final class FavoritesTools {
             ids.addAll(shown);       // any still showing go too: this is for clearing out the very last
             Cleancut.favLog("flush: " + hidden.size() + " hidden, " + shown.size() + " shown, after " + (pages + 1) + " pages");
             final String last = info;
+            ToolNotice.clear();
             Utils.runOnMainThread(() -> {
                 if (ids.isEmpty()) {
                     Activity activity = Utils.getVisibleActivity();
@@ -808,14 +1015,17 @@ public final class FavoritesTools {
         }
         busy = true;
         if (toast != null) Utils.showToastLong(toast);
+        keepScreenOn(true);      // TikTok drops its requests when the screen goes off
         Thread t = new Thread(() -> {
             try {
                 job.run();
             } catch (Throwable e) {
                 Cleancut.favLog("favourites tools: " + e);
+                ToolNotice.clear();
                 Utils.showToastLong("Couldn't do that: " + e.getMessage());
             } finally {
                 busy = false;
+                keepScreenOn(false);
             }
         }, "cleancut-tools");
         t.setDaemon(true);

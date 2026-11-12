@@ -56,12 +56,47 @@ final class ToolNotice {
         post(title, text, done, total, true);
     }
 
+    /**
+     * Finding things (before anything is removed): a bar toward how many are wanted, or a moving
+     * one when that isn't known. Updates more often than every 0.8 s are skipped.
+     */
+    static void scan(String title, String text, int found, int wanted) {
+        long now = System.currentTimeMillis();
+        if (now - lastUpdate < 800) return;
+        lastUpdate = now;
+        post(title, text, found, wanted, true, wanted <= 0);
+    }
+
+    /** A line of news during a run (what it's finding between removals): the bar stays, at most one a second. */
+    static void info(String title, String text, int done, int total) {
+        long now = System.currentTimeMillis();
+        if (now - lastUpdate < 1000) return;
+        lastUpdate = now;
+        post(title, text, done, total, true);
+    }
+
+    /** Takes the notification away (a search that ended and is handing over to a dialog). */
+    static void clear() {
+        try {
+            Context c = Utils.getContext();
+            if (c == null) return;
+            NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) nm.cancel(ID);
+        } catch (Throwable ignored) {
+            // nothing to take away
+        }
+    }
+
     /** How the run ended: no bar, can be swiped away. */
     static void finish(String title, String text) {
         post(title, text, 0, 0, false);
     }
 
     private static void post(String title, String text, int done, int total, boolean ongoing) {
+        post(title, text, done, total, ongoing, false);
+    }
+
+    private static void post(String title, String text, int done, int total, boolean ongoing, boolean moving) {
         try {
             Context c = Utils.getContext();
             if (c == null) return;
@@ -82,7 +117,8 @@ final class ToolNotice {
                     .setOngoing(ongoing)
                     .setAutoCancel(!ongoing)
                     .setShowWhen(!ongoing);
-            if (ongoing && total > 0) b.setProgress(total, Math.min(done, total), false);
+            if (ongoing && moving) b.setProgress(0, 0, true);
+            else if (ongoing && total > 0) b.setProgress(total, Math.min(done, total), false);
             Intent open = c.getPackageManager().getLaunchIntentForPackage(c.getPackageName());
             if (open != null) {
                 b.setContentIntent(PendingIntent.getActivity(c, 0, open,

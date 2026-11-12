@@ -239,9 +239,19 @@ public final class FavoritesOrder {
         if (args == null) {
             if (fetcher == null) throw new Exception("open your own Favourites tab once first, then try again");
             Object[] base = null;
+            int skipped = 0, baseType = -1;
             for (int t : new int[]{LIKED, FAVORITES, 0, 14}) {
                 Object[] a = ARGS_BY_TYPE.get(t);
-                if (a != null && Boolean.TRUE.equals(FIRST_PAGE.get(t)) && own(a, uid, secUid)) { base = a; break; }
+                if (a != null && Boolean.TRUE.equals(FIRST_PAGE.get(t)) && own(a, uid, secUid)) {
+                    if (skipped++ < baseSkip) continue;      // a retry tries another tab's request
+                    base = a;
+                    baseType = t;
+                    break;
+                }
+            }
+            if (base == null && baseSkip > 0) {              // none left to try: start again from the first
+                baseSkip = 0;
+                return likedPage(cursor, count, uid, secUid);
             }
             if (base == null) throw new Exception("open your own Favourites tab once first (it lends its request), then try again");
             args = base.clone();
@@ -253,15 +263,26 @@ public final class FavoritesOrder {
             args[13] = "";
             if (args[1] == null || String.valueOf(args[1]).isEmpty()) args[1] = uid;
             if (args[2] == null || String.valueOf(args[2]).isEmpty()) args[2] = secUid;
+            likedBase = "tab " + baseType;
             Page p = fetchPage(args, 0, 12);
-            Cleancut.favLog("liked list (tab " + LIKED + " from tab " + base[3] + "): " + p.ids.size()
+            Cleancut.favLog("liked list (tab " + LIKED + " from tab " + baseType + "): " + p.ids.size()
                     + " videos, liked " + p.liked + ", more " + p.more + ", next " + p.next);
-            // An empty first page with more after it is normal after many removals: the ones just
-            // unliked still sit at the top of TikTok's list, hidden.
-            if (p.ids.isEmpty() && !p.more) throw new Exception("TikTok sent an empty Liked list (details saved for Claude)");
+            // An empty first page is not an error here: the ones just unliked still sit at the top of
+            // TikTok's list, hidden. The reader decides what it means (it reads on, or reports it).
             likedArgs = args;
         }
         return fetchPage(args, cursor, count);
+    }
+
+    /** Which of your tabs' requests the Liked list was made from, for the notes ("tab 4"). */
+    static volatile String likedBase = "";
+    /** On a retry: how many tabs' requests to pass over before the one the Liked list is made from. */
+    private static volatile int baseSkip;
+
+    /** Starts the Liked list's request again, from another tab's request if there is one. */
+    static void retryLiked(boolean otherBase) {
+        likedArgs = null;
+        if (otherBase) baseSkip++;
     }
 
     private static Page fetchPage(Object[] args, long cursor, int count) throws Exception {
