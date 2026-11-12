@@ -286,7 +286,7 @@ public final class FavoritesTools {
     /** What looking through the Liked list found, and what TikTok said while it did. */
     private static final class LikesScan {
         final List<String> ids = new ArrayList<>();
-        int pages, emptyPages, errors, restarts;
+        int pages, emptyPages, errors, restarts, skips;
         /** Your like count, from your profile (-1 if it didn't say). */
         long total = -1;
         String last = "", how = "", direct = "";
@@ -297,6 +297,7 @@ public final class FavoritesTools {
             b.append("Pages read: ").append(pages).append(" (").append(emptyPages).append(" empty)");
             if (errors > 0) b.append(", failed requests: ").append(errors);
             b.append(".\nLast reply: ").append(last.isEmpty() ? "none" : last).append('.');
+            if (skips > 0) b.append("\nFollowed TikTok's pointer past ").append(skips).append(" empty pages.");
             if (restarts > 0) b.append("\nLooked again from the top ").append(restarts).append(restarts == 1 ? " time." : " times.");
             if (!FavoritesOrder.likedBase.isEmpty()) b.append("\nRequest copied from: ").append(FavoritesOrder.likedBase).append('.');
             if (!direct.isEmpty()) b.append("\nTikTok's direct list: ").append(direct).append('.');
@@ -370,7 +371,14 @@ public final class FavoritesTools {
             tell.say(fmt(s.ids.size()) + (n > 0 ? " of " + fmt(n) : "") + " found · page " + s.pages
                     + (emptyRun >= 5 ? " · reading past likes TikTok is still hiding…" : ""), s.ids.size(), n);
             if (s.pages % 10 == 0) Utils.showToastShort("Finding likes… " + fmt(s.ids.size()) + " so far");
-            boolean end = !p.more || p.next <= 0 || p.next == cursor;
+            // An empty page that carries a fresh pointer (TikTok hides the likes just removed, and says
+            // "no more" even so) is skipped past by following the pointer.
+            boolean skipOn = p.ids.isEmpty() && p.next > 0 && p.next != cursor && s.skips < 400;
+            if (!p.more && skipOn) s.skips++;
+            if (s.pages <= 3 || (!p.more && skipOn && s.skips <= 3)) {
+                Cleancut.favLog("likes scan page " + s.pages + " at " + cursor + ": " + s.last + (skipOn ? " (following)" : ""));
+            }
+            boolean end = p.next <= 0 || p.next == cursor || (!p.more && !skipOn);
             if (end) {
                 if (s.ids.isEmpty() && s.restarts < 3) {
                     // Nothing at all: TikTok may be catching up. Wait, then look again from the top,
@@ -438,7 +446,9 @@ public final class FavoritesTools {
             s.direct = got.isEmpty() && s.ids.isEmpty() ? "empty" : "worked";
             tell.say(fmt(s.ids.size()) + " found · plain list, page " + (guard + 1), s.ids.size(), n);
             long next = r.optLong("max_cursor", 0);
-            if (r.optInt("has_more", 0) != 1 || next <= 0 || next == cursor) return;
+            boolean skipOn = got.isEmpty() && next > 0 && next != cursor && s.skips < 400;
+            if (r.optInt("has_more", 0) != 1 && skipOn) s.skips++;
+            if (next <= 0 || next == cursor || (r.optInt("has_more", 0) != 1 && !skipOn)) return;
             cursor = next;
             sleep(400);
         }
