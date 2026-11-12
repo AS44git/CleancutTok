@@ -274,6 +274,20 @@ public final class FavoritesOrder {
         return fetchPage(args, cursor, count);
     }
 
+    /** Which tabs' requests have been seen since TikTok started, for the notes: "tab 14 (3 min ago), tab 4 (1 min ago)". */
+    static String capturedInfo() {
+        StringBuilder b = new StringBuilder();
+        long now = System.currentTimeMillis();
+        for (Map.Entry<Integer, Object[]> e : ARGS_BY_TYPE.entrySet()) {
+            Long at = SEEN_AT.get(e.getKey());
+            if (b.length() > 0) b.append(", ");
+            b.append("tab ").append(e.getKey());
+            if (!Boolean.TRUE.equals(FIRST_PAGE.get(e.getKey()))) b.append(" (not its first page)");
+            if (at != null) b.append(" (").append(Math.max(0, (now - at) / 60000)).append(" min ago)");
+        }
+        return b.length() == 0 ? "none" : b.toString();
+    }
+
     /** Which of your tabs' requests the Liked list was made from, for the notes ("tab 4"). */
     static volatile String likedBase = "";
     /** On a retry: how many tabs' requests to pass over before the one the Liked list is made from. */

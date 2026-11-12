@@ -283,10 +283,14 @@ public final class FavoritesTools {
         ownSecUid = user.optString("sec_uid", "");
     }
 
+    /** How many more times to ask again, a while apart, when TikTok's Liked list comes back empty. */
+    private static final int RETRIES = 7;
+
     /** What looking through the Liked list found, and what TikTok said while it did. */
     private static final class LikesScan {
         final List<String> ids = new ArrayList<>();
-        int pages, emptyPages, errors, restarts, skips;
+        int pages, emptyPages, errors, restarts, skips, hidden;
+        String hiddenInfo = "";
         /** Your like count, from your profile (-1 if it didn't say). */
         long total = -1;
         String last = "", how = "", direct = "";
@@ -297,6 +301,9 @@ public final class FavoritesTools {
             b.append("Pages read: ").append(pages).append(" (").append(emptyPages).append(" empty)");
             if (errors > 0) b.append(", failed requests: ").append(errors);
             b.append(".\nLast reply: ").append(last.isEmpty() ? "none" : last).append('.');
+            if (hidden > 0) b.append("\nHidden ones TikTok counts but won't show: ").append(hidden).append('.');
+            if (!hiddenInfo.isEmpty()) b.append("\nIts own counts of unavailable ones: ").append(hiddenInfo).append('.');
+            b.append("\nTabs captured: ").append(FavoritesOrder.capturedInfo()).append('.');
             if (skips > 0) b.append("\nFollowed TikTok's pointer past ").append(skips).append(" empty pages.");
             if (restarts > 0) b.append("\nLooked again from the top ").append(restarts).append(restarts == 1 ? " time." : " times.");
             if (!FavoritesOrder.likedBase.isEmpty()) b.append("\nRequest copied from: ").append(FavoritesOrder.likedBase).append('.');
@@ -365,7 +372,15 @@ public final class FavoritesTools {
                     if (s.ids.size() >= n) break;
                 }
             }
-            if (p.ids.isEmpty()) s.emptyPages++;
+            for (String id : p.invalid) {
+                if (s.ids.size() < n && seen.add(id)) {
+                    s.ids.add(id);
+                    s.hidden++;
+                    added++;
+                }
+            }
+            if (!p.invalidInfo.isEmpty() && !p.invalidInfo.equals("null/null/null/null")) s.hiddenInfo = p.invalidInfo;
+            if (p.ids.isEmpty() && p.invalid.isEmpty()) s.emptyPages++;
             emptyRun = added == 0 ? emptyRun + 1 : 0;
             s.last = "got " + p.ids.size() + ", more " + (p.more ? "yes" : "no") + ", next " + p.next;
             tell.say(fmt(s.ids.size()) + (n > 0 ? " of " + fmt(n) : "") + " found · page " + s.pages
@@ -380,16 +395,24 @@ public final class FavoritesTools {
             }
             boolean end = p.next <= 0 || p.next == cursor || (!p.more && !skipOn);
             if (end) {
-                if (s.ids.isEmpty() && s.restarts < 3) {
-                    // Nothing at all: TikTok may be catching up. Wait, then look again from the top,
-                    // a little differently each time.
+                if (s.ids.isEmpty() && s.restarts < RETRIES) {
+                    // Nothing at all: TikTok's list can lag and show up a few tries later. Wait, then
+                    // look again, a little differently each time: where it starts ("now" in each unit
+                    // TikTok uses), the page size, and which tab's request it's made from.
                     s.restarts++;
-                    tell.say("TikTok's list looks empty, looking again in a few seconds (" + s.restarts + " of 3)…", 0, n);
-                    sleep(4000L * s.restarts);
-                    FavoritesOrder.retryLiked(s.restarts >= 2);
-                    cursor = 0;
+                    long wait = Math.min(30_000L, 8_000L * s.restarts);
+                    for (long left = wait; left > 0; left -= 1000) {
+                        tell.say("TikTok's list is empty. Trying again in " + (left / 1000) + "s (attempt "
+                                + (s.restarts + 1) + " of " + (RETRIES + 1) + ")…", 0, n);
+                        sleep(1000);
+                    }
+                    likesNow();      // a look at your profile too, in case it nudges TikTok's side
+                    FavoritesOrder.retryLiked(s.restarts % 2 == 0);
+                    long ms = System.currentTimeMillis();
+                    long[] starts = {0, 0, ms * 1000, ms, ms / 1000, 0, ms * 1000, ms};
+                    cursor = starts[Math.min(s.restarts, starts.length - 1)];
                     emptyRun = 0;
-                    count = new int[]{30, 20, 10, 50}[s.restarts];
+                    count = new int[]{30, 30, 20, 10, 50, 30, 20, 10, 30}[Math.min(s.restarts, 8)];
                     continue;
                 }
                 break;
