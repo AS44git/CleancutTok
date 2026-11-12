@@ -122,6 +122,8 @@ public final class FavoritesTools {
         actions.add(FavoritesTools::flushHidden);
         labels.add("Liked: remove my most recent likes…");
         actions.add(FavoritesTools::pickLikes);
+        labels.add("Liked: remove the likes from my TikTok data file");
+        actions.add(FavoritesTools::importLikes);
         labels.add("Liked: count my liked videos");
         actions.add(FavoritesTools::countLiked);
         boolean oldest = FavoritesOrder.oldestFirst();
@@ -188,6 +190,7 @@ public final class FavoritesTools {
                 .setItems(choices, (d, which) -> {
                     int n = amounts[which];
                     likesWanted = n;
+                    fromFile = false;
                     work("Finding your " + fmt(n) + " most recent likes… (progress in your notifications)", () -> {
                         LikesScan scan = scanLikes(n, new HashSet<>(), true,
                                 (t, f, w) -> ToolNotice.scan("Finding your likes", t, f, w));
@@ -207,6 +210,66 @@ public final class FavoritesTools {
                     });
                 })
                 .show();
+    }
+
+    /** Set while a run works from a data file: the Liked list isn't read again when the file's ids run out. */
+    private static volatile boolean fromFile;
+
+    /**
+     * For when TikTok won't list your likes: reads the video ids from the Like List in your TikTok
+     * data download (Settings > Account > Download your data), and unlikes each by id. The file goes
+     * in this app's own folder: Android/data/<this app>/files/ as likes.txt (or Like List.txt).
+     */
+    private static void importLikes() {
+        Activity activity = Utils.getVisibleActivity();
+        if (activity == null) return;
+        work("Reading your likes file…", () -> {
+            java.io.File dir = Utils.getContext().getExternalFilesDir(null);
+            java.io.File f = null;
+            if (dir != null) {
+                for (String name : new String[]{"likes.txt", "Like List.txt", "like list.txt", "likes.json"}) {
+                    java.io.File c = new java.io.File(dir, name);
+                    if (c.isFile()) { f = c; break; }
+                }
+            }
+            List<String> ids = new ArrayList<>();
+            if (f != null) {
+                java.util.regex.Pattern pat = java.util.regex.Pattern.compile("(?:video/|\"id\"\\s*:\\s*\"?)(\\d{15,22})|^(\\d{15,22})$");
+                Set<String> seen = new HashSet<>();
+                try (java.io.BufferedReader r = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"))) {
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        java.util.regex.Matcher m = pat.matcher(line.trim());
+                        while (m.find()) {
+                            String id = m.group(1) != null ? m.group(1) : m.group(2);
+                            if (seen.add(id)) ids.add(id);      // newest first, as the file lists them
+                        }
+                    }
+                }
+            }
+            ToolNotice.clear();
+            final java.io.File file = f;
+            final String where = dir == null ? "this app's files folder" : dir.getAbsolutePath();
+            Utils.runOnMainThread(() -> {
+                if (ids.isEmpty()) {
+                    Activity a = Utils.getVisibleActivity();
+                    if (a == null) return;
+                    new AlertDialog.Builder(a)
+                            .setTitle(file == null ? "No likes file found" : "No videos in that file")
+                            .setMessage("Put the Like List from your TikTok data download here, named likes.txt:\n\n"
+                                    + where)
+                            .setPositiveButton("OK", null)
+                            .show();
+                    return;
+                }
+                likesWanted = ids.size();
+                fromFile = true;
+                confirmRemove(Kind.LIKES, ids, "Unlike " + fmt(ids.size()) + " videos from your file?",
+                        "Newest first, by their ids, so TikTok's Liked list isn't needed. "
+                                + plan(Kind.LIKES, ids.size()));
+            });
+        });
     }
 
     /** "About 9 minutes. Up to 1,500 a day; ..." */
@@ -620,13 +683,13 @@ public final class FavoritesTools {
         int noAnswer = 0;
         boolean dried = false;
         List<String> firstDone = new ArrayList<>();
-        boolean checked = k != Kind.LIKES;
+        boolean checked = k != Kind.LIKES || fromFile;
         Utils.showToastLong("Removing " + fmt(total) + " " + k.noun + "… (progress in your notifications)");
         String title = "Removing " + k.noun;
         ToolNotice.note(title, "Starting: 0 of " + fmt(total), 0, total);
         while (true) {
             if (left.isEmpty()) {
-                if (k != Kind.LIKES || removed >= target) break;
+                if (k != Kind.LIKES || removed >= target || fromFile) break;
                 List<String> more = refillLikes(done, target - removed, removed, total, title);
                 if (more.isEmpty()) {
                     dried = true;
