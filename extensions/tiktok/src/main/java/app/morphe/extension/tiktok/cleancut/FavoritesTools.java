@@ -229,6 +229,46 @@ public final class FavoritesTools {
         return s < 0 || s >= SPEEDS.length ? 1 : s;
     }
 
+    /** How many requests go at once at each speed (a refusal drops it to one until things calm down). */
+    private static final int[] WIDTH = {1, 1, 3, 6};
+    private static final java.util.concurrent.ExecutorService POOL = java.util.concurrent.Executors.newFixedThreadPool(8, r -> {
+        Thread t = new Thread(r, "cleancut-unlike");
+        t.setDaemon(true);
+        return t;
+    });
+
+    /**
+     * One request's answer. At width 1 it's asked for here and now; wider, the next few ids' requests
+     * are sent together, and each answer is taken as its turn comes, so the pace isn't set by one
+     * slow reply at a time.
+     */
+    private static String fetch(Kind k, List<String> left, String id, boolean usePost,
+                                Map<String, java.util.concurrent.Future<String>> inflight, int width) throws Exception {
+        if (width <= 1) {
+            inflight.clear();
+            String url = k.url(id);
+            return usePost ? post(url) : get(url);
+        }
+        for (int i = 0; i < Math.min(width, left.size()); i++) {
+            String x = left.get(i);
+            if (inflight.containsKey(x)) continue;
+            final String u = k.url(x);
+            inflight.put(x, POOL.submit(() -> usePost ? post(u) : get(u)));
+        }
+        java.util.concurrent.Future<String> f = inflight.remove(id);
+        if (f == null) {
+            String url = k.url(id);
+            return usePost ? post(url) : get(url);
+        }
+        try {
+            return f.get(90, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (java.util.concurrent.ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) throw (Exception) cause;
+            throw e;
+        }
+    }
+
     private static long every(Kind k) {
         return (k == Kind.LIKES ? LIKES_MS : FAV_MS)[speed()];
     }
@@ -239,8 +279,8 @@ public final class FavoritesTools {
         String[] labels = {
                 "Normal: about 1.5 s each (the gentlest)",
                 "Fast: about 0.3 s each",
-                "Very fast: about 0.1 s each",
-                "Max: back to back, as fast as TikTok answers",
+                "Very fast: about 0.1 s each, 3 at a time",
+                "Max: back to back, 6 at a time",
         };
         new AlertDialog.Builder(activity)
                 .setTitle("Removing speed")
@@ -727,6 +767,8 @@ public final class FavoritesTools {
         int inARow = 0;
         boolean usePost = k.post, triedPost = k.post;
         Map<String, Integer> tries = new HashMap<>();
+        Map<String, java.util.concurrent.Future<String>> inflight = new HashMap<>();
+        long startedAt = System.currentTimeMillis();
         int noAnswer = 0;
         double pace = 1.0;
         boolean dried = false;
@@ -761,7 +803,7 @@ public final class FavoritesTools {
             boolean offline = false;
             try {
                 String url = k.url(id);
-                String raw = usePost ? post(url) : get(url);
+                String raw = fetch(k, left, id, usePost, inflight, pace > 1.0 ? 1 : WIDTH[speed()]);
                 JSONObject r;
                 try {
                     r = new JSONObject(raw);
@@ -835,8 +877,10 @@ public final class FavoritesTools {
                 }
                 if (removed % 10 == 0) savePending(k, left);
                 if (removed % 50 == 0) Utils.showToastShort("Removed " + fmt(removed) + " of " + fmt(total) + " " + k.noun + "…");
-                ToolNotice.progress(title, fmt(removed) + " of " + fmt(total) + " · about "
-                        + minutes(k, Math.max(0, total - removed)) + " left", removed, total);
+                long ran = System.currentTimeMillis() - startedAt;
+                ToolNotice.progress(title, fmt(removed) + " of " + fmt(total) + " · "
+                        + (ran > 20_000 ? Math.round(removed * 60000.0 / ran) + "/min · " : "")
+                        + "about " + minutes(k, Math.max(0, total - removed)) + " left", removed, total);
                 // Quick while TikTok says yes; any "no" slows it (pace), and it speeds up again as yeses return.
                 if (removed % 25 == 0 && pace > 1.0) pace = Math.max(1.0, pace - 0.25);
                 long base = every(k);
