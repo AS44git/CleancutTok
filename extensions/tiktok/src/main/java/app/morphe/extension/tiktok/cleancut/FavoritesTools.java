@@ -124,6 +124,8 @@ public final class FavoritesTools {
         actions.add(FavoritesTools::pickLikes);
         labels.add("Favourites: remove the ones from my TikTok data file");
         actions.add(() -> importFile(Kind.FAVOURITES));
+        labels.add("Speed: " + SPEEDS[speed()] + " (tap to change)");
+        actions.add(FavoritesTools::pickSpeed);
         labels.add("Liked: remove the likes from my TikTok data file");
         actions.add(() -> importFile(Kind.LIKES));
         labels.add("Liked: count my liked videos");
@@ -211,6 +213,44 @@ public final class FavoritesTools {
                         });
                     });
                 })
+                .show();
+    }
+
+    // --- speed ---------------------------------------------------------------------------------
+
+    private static final String[] SPEEDS = {"Normal", "Fast", "Very fast", "Max"};
+    /** Milliseconds between removals at each speed: likes, favourites. */
+    private static final int[] LIKES_MS = {1600, 300, 120, 0};
+    private static final int[] FAV_MS = {1200, 700, 300, 0};
+
+    private static int speed() {
+        SharedPreferences p = prefs();
+        int s = p == null ? 1 : p.getInt("speed", 1);
+        return s < 0 || s >= SPEEDS.length ? 1 : s;
+    }
+
+    private static long every(Kind k) {
+        return (k == Kind.LIKES ? LIKES_MS : FAV_MS)[speed()];
+    }
+
+    private static void pickSpeed() {
+        Activity activity = Utils.getVisibleActivity();
+        if (activity == null) return;
+        String[] labels = {
+                "Normal: about 1.5 s each (the gentlest)",
+                "Fast: about 0.3 s each",
+                "Very fast: about 0.1 s each",
+                "Max: back to back, as fast as TikTok answers",
+        };
+        new AlertDialog.Builder(activity)
+                .setTitle("Removing speed")
+                .setSingleChoiceItems(labels, speed(), (d, which) -> {
+                    SharedPreferences p = prefs();
+                    if (p != null) p.edit().putInt("speed", which).apply();
+                    Utils.showToastLong("Speed: " + SPEEDS[which] + ". It applies to the next run, or the one going now.");
+                    d.dismiss();
+                })
+                .setNegativeButton("Cancel", null)
                 .show();
     }
 
@@ -799,7 +839,10 @@ public final class FavoritesTools {
                         + minutes(k, Math.max(0, total - removed)) + " left", removed, total);
                 // Quick while TikTok says yes; any "no" slows it (pace), and it speeds up again as yeses return.
                 if (removed % 25 == 0 && pace > 1.0) pace = Math.max(1.0, pace - 0.25);
-                sleep((long) ((k.every + RANDOM.nextInt((int) (k.every / 3 + 100))) * pace));
+                long base = every(k);
+                long gap = base == 0 ? 0 : base + RANDOM.nextInt((int) (base / 3 + 50));
+                // A refusal slows it whatever the speed (even at Max), and it eases back as yeses return.
+                sleep((long) (gap * pace) + (long) (400 * (pace - 1.0)));
                 continue;
             }
             if (fromFile && removed == 0) {
@@ -873,7 +916,7 @@ public final class FavoritesTools {
     }
 
     private static String minutes(Kind k, int n) {
-        long m = Math.max(1, Math.round(n * (k.every + k.every / 6.0 + 100 + 400) / 60000.0));
+        long m = Math.max(1, Math.round(n * (every(k) + every(k) / 6.0 + (every(k) == 0 ? 0 : 50) + 400) / 60000.0));
         return m >= 90 ? (Math.round(m / 6.0) / 10.0) + " hours" : m + (m == 1 ? " minute" : " minutes");
     }
 
