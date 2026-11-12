@@ -60,14 +60,14 @@ public final class FavoritesTools {
 
     /** What a run removes, and how gently. */
     private enum Kind {
-        FAVOURITES("favourites", "remove_pending", 1500, 1200, false),
-        LIKES("likes", "likes_pending", 6000, 1600, true);
+        FAVOURITES("favourites", "remove_pending", 1500, 700, false),
+        LIKES("likes", "likes_pending", 6000, 300, true);
 
         final String noun;
         final String key;
         /** At most this many a day. */
         final int daily;
-        /** Milliseconds between removals (plus up to 0.6 s at random). */
+        /** Milliseconds between removals (plus up to a third as much again at random). */
         final long every;
 
         /** TikTok's own app sends this one as a POST (parameters in the address). */
@@ -122,8 +122,10 @@ public final class FavoritesTools {
         actions.add(FavoritesTools::flushHidden);
         labels.add("Liked: remove my most recent likes…");
         actions.add(FavoritesTools::pickLikes);
+        labels.add("Favourites: remove the ones from my TikTok data file");
+        actions.add(() -> importFile(Kind.FAVOURITES));
         labels.add("Liked: remove the likes from my TikTok data file");
-        actions.add(FavoritesTools::importLikes);
+        actions.add(() -> importFile(Kind.LIKES));
         labels.add("Liked: count my liked videos");
         actions.add(FavoritesTools::countLiked);
         boolean oldest = FavoritesOrder.oldestFirst();
@@ -220,14 +222,18 @@ public final class FavoritesTools {
      * data download (Settings > Account > Download your data), and unlikes each by id. The file goes
      * in this app's own folder: Android/data/<this app>/files/ as likes.txt (or Like List.txt).
      */
-    private static void importLikes() {
+    private static void importFile(Kind kind) {
         Activity activity = Utils.getVisibleActivity();
         if (activity == null) return;
-        work("Reading your likes file…", () -> {
+        final boolean likes = kind == Kind.LIKES;
+        final String[] names = likes
+                ? new String[]{"likes.txt", "Like List.txt", "like list.txt", "likes.json"}
+                : new String[]{"favourites.txt", "Favourite Videos.txt", "favorites.txt"};
+        work("Reading your " + kind.noun + " file…", () -> {
             java.io.File dir = Utils.getContext().getExternalFilesDir(null);
             java.io.File f = null;
             if (dir != null) {
-                for (String name : new String[]{"likes.txt", "Like List.txt", "like list.txt", "likes.json"}) {
+                for (String name : names) {
                     java.io.File c = new java.io.File(dir, name);
                     if (c.isFile()) { f = c; break; }
                 }
@@ -256,18 +262,19 @@ public final class FavoritesTools {
                     Activity a = Utils.getVisibleActivity();
                     if (a == null) return;
                     new AlertDialog.Builder(a)
-                            .setTitle(file == null ? "No likes file found" : "No videos in that file")
-                            .setMessage("Put the Like List from your TikTok data download here, named likes.txt:\n\n"
-                                    + where)
+                            .setTitle(file == null ? "No " + kind.noun + " file found" : "No videos in that file")
+                            .setMessage("Put the " + (likes ? "Like List" : "Favourite Videos") + " file from your TikTok data download here, named "
+                                    + names[0] + ":\n\n" + where)
                             .setPositiveButton("OK", null)
                             .show();
                     return;
                 }
-                likesWanted = ids.size();
-                fromFile = true;
-                confirmRemove(Kind.LIKES, ids, "Unlike " + fmt(ids.size()) + " videos from your file?",
-                        "Newest first, by their ids, so TikTok's Liked list isn't needed. "
-                                + plan(Kind.LIKES, ids.size()));
+                if (likes) {
+                    likesWanted = ids.size();
+                    fromFile = true;
+                }
+                confirmRemove(kind, ids, (likes ? "Unlike " : "Remove from favourites: ") + fmt(ids.size()) + " videos from your file?",
+                        "Newest first, by their ids, so TikTok's list isn't needed. " + plan(kind, ids.size()));
             });
         });
     }
@@ -681,9 +688,13 @@ public final class FavoritesTools {
         boolean usePost = k.post, triedPost = k.post;
         Map<String, Integer> tries = new HashMap<>();
         int noAnswer = 0;
+        double pace = 1.0;
         boolean dried = false;
         List<String> firstDone = new ArrayList<>();
         boolean checked = k != Kind.LIKES || fromFile;
+        // From a data file, the newest ids may already be unliked (done by hand since it was made):
+        // until the first one really goes, refusals are skipped over, not counted as TikTok saying no.
+        List<String> skipped = new ArrayList<>();
         Utils.showToastLong("Removing " + fmt(total) + " " + k.noun + "… (progress in your notifications)");
         String title = "Removing " + k.noun;
         ToolNotice.note(title, "Starting: 0 of " + fmt(total), 0, total);
@@ -760,6 +771,11 @@ public final class FavoritesTools {
             if (why == null) {
                 left.remove(0);
                 done.add(id);
+                if (removed == 0 && !skipped.isEmpty()) {
+                    Cleancut.favLog("file run: skipped " + skipped.size() + " already gone, then removals began");
+                    Utils.showToastShort("Skipped " + fmt(skipped.size()) + " that were already unliked.");
+                    skipped.clear();
+                }
                 removed++;
                 inARow = 0;
                 countToday(k);
@@ -781,10 +797,31 @@ public final class FavoritesTools {
                 if (removed % 50 == 0) Utils.showToastShort("Removed " + fmt(removed) + " of " + fmt(total) + " " + k.noun + "…");
                 ToolNotice.progress(title, fmt(removed) + " of " + fmt(total) + " · about "
                         + minutes(k, Math.max(0, total - removed)) + " left", removed, total);
-                sleep(k.every + RANDOM.nextInt(600));
+                // Quick while TikTok says yes; any "no" slows it (pace), and it speeds up again as yeses return.
+                if (removed % 25 == 0 && pace > 1.0) pace = Math.max(1.0, pace - 0.25);
+                sleep((long) ((k.every + RANDOM.nextInt((int) (k.every / 3 + 100))) * pace));
+                continue;
+            }
+            if (fromFile && removed == 0) {
+                skipped.add(id);
+                left.remove(0);
+                if (skipped.size() == 1) Cleancut.favLog("file run: first refusal, skipping ahead: " + id + ": " + why);
+                if (skipped.size() >= 1500) {
+                    left.addAll(0, skipped);        // nothing at all went: keep every one
+                    savePending(k, left);
+                    saveTarget(k, target);
+                    ended(k, "Stopped: TikTok refused the first 1,500 in the file (" + why + "), so nothing was removed. "
+                            + "The details are in cleancut-favourites.txt for Claude.");
+                    return;
+                }
+                if (skipped.size() % 25 == 0) {
+                    ToolNotice.note(title, "Skipping likes that are already gone: " + fmt(skipped.size()) + " so far…", 0, total);
+                }
+                sleep(250 + RANDOM.nextInt(250));
                 continue;
             }
             Cleancut.favLog("remove " + k.noun + " " + id + ": " + why);
+            pace = Math.min(5.0, pace + 1.0);
             inARow++;
             left.remove(0);
             int t = tries.containsKey(id) ? tries.get(id) + 1 : 1;
@@ -836,7 +873,7 @@ public final class FavoritesTools {
     }
 
     private static String minutes(Kind k, int n) {
-        long m = Math.max(1, Math.round(n * (k.every + 300 + 400) / 60000.0));
+        long m = Math.max(1, Math.round(n * (k.every + k.every / 6.0 + 100 + 400) / 60000.0));
         return m >= 90 ? (Math.round(m / 6.0) / 10.0) + " hours" : m + (m == 1 ? " minute" : " minutes");
     }
 
