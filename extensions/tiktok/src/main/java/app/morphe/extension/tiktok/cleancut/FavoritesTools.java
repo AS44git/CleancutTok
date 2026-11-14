@@ -230,9 +230,12 @@ public final class FavoritesTools {
     }
 
     /** How many requests go at once at each speed (a refusal drops it to one until things calm down). */
-    private static final int[] WIDTH = {1, 1, 3, 4};        // where it starts
-    private static final int[] MAX_WIDTH = {1, 1, 6, 12};   // the most it climbs to while TikTok keeps saying yes
-    private static final java.util.concurrent.ExecutorService POOL = java.util.concurrent.Executors.newFixedThreadPool(12, r -> {
+    private static final int[] WIDTH = {1, 1, 4, 8};         // where it starts
+    private static final int[] MAX_WIDTH = {1, 1, 10, 24};   // the most it climbs to while TikTok keeps saying yes
+    /** How long each request took, to see whether the wait is the network (more at once helps) or not. */
+    private static final java.util.concurrent.atomic.AtomicLong LAT_SUM = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong LAT_N = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.ExecutorService POOL = java.util.concurrent.Executors.newFixedThreadPool(26, r -> {
         Thread t = new Thread(r, "cleancut-unlike");
         t.setDaemon(true);
         return t;
@@ -247,20 +250,21 @@ public final class FavoritesTools {
                                 Map<String, java.util.concurrent.Future<String>> inflight, int width) throws Exception {
         if (width <= 1) {
             inflight.clear();
-            String url = k.url(id);
-            return usePost ? post(url) : get(url);
+            return timed(k.url(id), usePost);
         }
-        for (int i = 0; i < Math.min(width, left.size()); i++) {
+        // Keep `width` requests actually running: finished answers waiting their turn don't count,
+        // so one slow reply at the front doesn't shrink what's in flight.
+        int running = 0;
+        for (java.util.concurrent.Future<String> f : inflight.values()) if (!f.isDone()) running++;
+        for (int i = 0; i < left.size() && running < width && i < width * 8; i++) {
             String x = left.get(i);
             if (inflight.containsKey(x)) continue;
             final String u = k.url(x);
-            inflight.put(x, POOL.submit(() -> usePost ? post(u) : get(u)));
+            inflight.put(x, POOL.submit(() -> timed(u, usePost)));
+            running++;
         }
         java.util.concurrent.Future<String> f = inflight.remove(id);
-        if (f == null) {
-            String url = k.url(id);
-            return usePost ? post(url) : get(url);
-        }
+        if (f == null) return timed(k.url(id), usePost);
         try {
             return f.get(90, java.util.concurrent.TimeUnit.SECONDS);
         } catch (java.util.concurrent.ExecutionException e) {
@@ -291,6 +295,22 @@ public final class FavoritesTools {
         }
         inflight.clear();
         return ok;
+    }
+
+    private static String timed(String url, boolean usePost) throws Exception {
+        long t0 = System.nanoTime();
+        try {
+            return usePost ? post(url) : get(url);
+        } finally {
+            LAT_SUM.addAndGet((System.nanoTime() - t0) / 1_000_000L);
+            LAT_N.incrementAndGet();
+        }
+    }
+
+    /** Average milliseconds per request since the run began (0 until there is one). */
+    private static long avgMs(long sum0, long n0) {
+        long n = LAT_N.get() - n0;
+        return n <= 0 ? 0 : (LAT_SUM.get() - sum0) / n;
     }
 
     private static long every(Kind k) {
@@ -799,6 +819,7 @@ public final class FavoritesTools {
         int ceiling = MAX_WIDTH[speed()];            // lowered a notch whenever a "no" came at a width
         int yesRun = 0;                              // yeses in a row since the last "no"
         long lastSave = System.currentTimeMillis();
+        final long latSum0 = LAT_SUM.get(), latN0 = LAT_N.get();
         boolean dried = false;
         List<String> firstDone = new ArrayList<>();
         boolean checked = k != Kind.LIKES || fromFile;
@@ -903,17 +924,24 @@ public final class FavoritesTools {
                         return;
                     }
                 }
-                if (++yesRun % 15 == 0 && width < ceiling && pace <= 1.0) width++;       // quicker while it's all yes
+                if (++yesRun % 10 == 0 && width < ceiling && pace <= 1.0) width = Math.min(ceiling, width + 2);       // quicker while it's all yes
                 if (yesRun % 400 == 0 && ceiling < MAX_WIDTH[speed()]) ceiling++;       // and try the higher ceiling again
                 if (removed % 40 == 0 || System.currentTimeMillis() - lastSave > 6000) {
                     savePending(k, left);
                     lastSave = System.currentTimeMillis();
+                }
+                if (removed % 200 == 0) {
+                    long ranNow = Math.max(1, System.currentTimeMillis() - startedAt);
+                    Cleancut.favLog("rate: " + removed + " in " + (ranNow / 1000) + "s = "
+                            + Math.round(removed * 60000.0 / ranNow) + "/min, at " + width + " at once (ceiling " + ceiling
+                            + "), average reply " + avgMs(latSum0, latN0) + " ms");
                 }
                 if (removed % 50 == 0) Utils.showToastShort("Removed " + fmt(removed) + " of " + fmt(total) + " " + k.noun + "…");
                 long ran = System.currentTimeMillis() - startedAt;
                 ToolNotice.progress(title, fmt(removed) + " of " + fmt(total) + " · "
                         + (ran > 20_000 ? Math.round(removed * 60000.0 / ran) + "/min · " : "")
                         + (width > 1 && pace <= 1.0 ? width + " at once · " : "")
+                        + (LAT_N.get() - latN0 >= 20 ? String.format(java.util.Locale.US, "%.1fs each · ", avgMs(latSum0, latN0) / 1000.0) : "")
                         + "about " + minutes(k, Math.max(0, total - removed)) + " left", removed, total);
                 // Quick while TikTok says yes; any "no" slows it (pace), and it speeds up again as yeses return.
                 if (removed % 25 == 0 && pace > 1.0) pace = Math.max(1.0, pace - 0.25);
