@@ -61,7 +61,7 @@ public final class FavoritesTools {
     /** What a run removes, and how gently. */
     private enum Kind {
         FAVOURITES("favourites", "remove_pending", 1500, 700, false),
-        LIKES("likes", "likes_pending", 6000, 300, true);
+        LIKES("likes", "likes_pending", 10000, 300, true);
 
         final String noun;
         final String key;
@@ -225,13 +225,14 @@ public final class FavoritesTools {
 
     private static int speed() {
         SharedPreferences p = prefs();
-        int s = p == null ? 1 : p.getInt("speed", 1);
-        return s < 0 || s >= SPEEDS.length ? 1 : s;
+        int s = p == null ? 3 : p.getInt("speed", 3);
+        return s < 0 || s >= SPEEDS.length ? 3 : s;
     }
 
     /** How many requests go at once at each speed (a refusal drops it to one until things calm down). */
-    private static final int[] WIDTH = {1, 1, 3, 6};
-    private static final java.util.concurrent.ExecutorService POOL = java.util.concurrent.Executors.newFixedThreadPool(8, r -> {
+    private static final int[] WIDTH = {1, 1, 3, 4};        // where it starts
+    private static final int[] MAX_WIDTH = {1, 1, 6, 12};   // the most it climbs to while TikTok keeps saying yes
+    private static final java.util.concurrent.ExecutorService POOL = java.util.concurrent.Executors.newFixedThreadPool(12, r -> {
         Thread t = new Thread(r, "cleancut-unlike");
         t.setDaemon(true);
         return t;
@@ -269,6 +270,29 @@ public final class FavoritesTools {
         }
     }
 
+    /**
+     * After a refusal: the requests still in flight are collected, not counted as more refusals (one
+     * "no" from TikTok shows up in all of them at once). Any that went through count as removed.
+     */
+    private static int settle(Kind k, Map<String, java.util.concurrent.Future<String>> inflight,
+                              List<String> left, Set<String> done) {
+        int ok = 0;
+        for (Map.Entry<String, java.util.concurrent.Future<String>> e : inflight.entrySet()) {
+            try {
+                String raw = e.getValue().get(25, java.util.concurrent.TimeUnit.SECONDS);
+                if (new JSONObject(raw).optInt("status_code", -1) == 0 && left.remove(e.getKey())) {
+                    done.add(e.getKey());
+                    countToday(k);
+                    ok++;
+                }
+            } catch (Throwable ignored) {
+                // that one is simply asked again later
+            }
+        }
+        inflight.clear();
+        return ok;
+    }
+
     private static long every(Kind k) {
         return (k == Kind.LIKES ? LIKES_MS : FAV_MS)[speed()];
     }
@@ -279,8 +303,8 @@ public final class FavoritesTools {
         String[] labels = {
                 "Normal: about 1.5 s each (the gentlest)",
                 "Fast: about 0.3 s each",
-                "Very fast: about 0.1 s each, 3 at a time",
-                "Max: back to back, 6 at a time",
+                "Very fast: 3 at a time, up to 6 while TikTok says yes",
+                "Max: 4 at a time, up to 12 while TikTok says yes (finds its own speed)",
         };
         new AlertDialog.Builder(activity)
                 .setTitle("Removing speed")
@@ -771,6 +795,10 @@ public final class FavoritesTools {
         long startedAt = System.currentTimeMillis();
         int noAnswer = 0;
         double pace = 1.0;
+        int width = WIDTH[speed()];                  // requests in flight; climbs while TikTok says yes
+        int ceiling = MAX_WIDTH[speed()];            // lowered a notch whenever a "no" came at a width
+        int yesRun = 0;                              // yeses in a row since the last "no"
+        long lastSave = System.currentTimeMillis();
         boolean dried = false;
         List<String> firstDone = new ArrayList<>();
         boolean checked = k != Kind.LIKES || fromFile;
@@ -803,7 +831,7 @@ public final class FavoritesTools {
             boolean offline = false;
             try {
                 String url = k.url(id);
-                String raw = fetch(k, left, id, usePost, inflight, pace > 1.0 ? 1 : WIDTH[speed()]);
+                String raw = fetch(k, left, id, usePost, inflight, pace > 1.0 ? 1 : width);
                 JSONObject r;
                 try {
                     r = new JSONObject(raw);
@@ -875,11 +903,17 @@ public final class FavoritesTools {
                         return;
                     }
                 }
-                if (removed % 10 == 0) savePending(k, left);
+                if (++yesRun % 15 == 0 && width < ceiling && pace <= 1.0) width++;       // quicker while it's all yes
+                if (yesRun % 400 == 0 && ceiling < MAX_WIDTH[speed()]) ceiling++;       // and try the higher ceiling again
+                if (removed % 40 == 0 || System.currentTimeMillis() - lastSave > 6000) {
+                    savePending(k, left);
+                    lastSave = System.currentTimeMillis();
+                }
                 if (removed % 50 == 0) Utils.showToastShort("Removed " + fmt(removed) + " of " + fmt(total) + " " + k.noun + "…");
                 long ran = System.currentTimeMillis() - startedAt;
                 ToolNotice.progress(title, fmt(removed) + " of " + fmt(total) + " · "
                         + (ran > 20_000 ? Math.round(removed * 60000.0 / ran) + "/min · " : "")
+                        + (width > 1 && pace <= 1.0 ? width + " at once · " : "")
                         + "about " + minutes(k, Math.max(0, total - removed)) + " left", removed, total);
                 // Quick while TikTok says yes; any "no" slows it (pace), and it speeds up again as yeses return.
                 if (removed % 25 == 0 && pace > 1.0) pace = Math.max(1.0, pace - 0.25);
@@ -907,7 +941,14 @@ public final class FavoritesTools {
                 sleep(250 + RANDOM.nextInt(250));
                 continue;
             }
-            Cleancut.favLog("remove " + k.noun + " " + id + ": " + why);
+            Cleancut.favLog("remove " + k.noun + " " + id + ": " + why + (width > 1 ? " (at " + width + " at once)" : ""));
+            if (inflight.size() > 0) {
+                int ok = settle(k, inflight, left, done);
+                removed += ok;
+            }
+            if (width > 1) ceiling = Math.max(1, Math.min(ceiling, width - 1));
+            width = Math.max(1, width / 2);
+            yesRun = 0;
             pace = Math.min(5.0, pace + 1.0);
             inARow++;
             left.remove(0);
