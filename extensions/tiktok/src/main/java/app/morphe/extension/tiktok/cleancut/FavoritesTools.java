@@ -232,86 +232,11 @@ public final class FavoritesTools {
     /** How many requests go at once at each speed (a refusal drops it to one until things calm down). */
     private static final int[] WIDTH = {1, 1, 4, 8};         // where it starts
     private static final int[] MAX_WIDTH = {1, 1, 10, 24};   // the most it climbs to while TikTok keeps saying yes
-    /** How long each request took, to see whether the wait is the network (more at once helps) or not. */
-    private static final java.util.concurrent.atomic.AtomicLong LAT_SUM = new java.util.concurrent.atomic.AtomicLong();
-    private static final java.util.concurrent.atomic.AtomicLong LAT_N = new java.util.concurrent.atomic.AtomicLong();
     private static final java.util.concurrent.ExecutorService POOL = java.util.concurrent.Executors.newFixedThreadPool(26, r -> {
         Thread t = new Thread(r, "cleancut-unlike");
         t.setDaemon(true);
         return t;
     });
-
-    /**
-     * One request's answer. At width 1 it's asked for here and now; wider, the next few ids' requests
-     * are sent together, and each answer is taken as its turn comes, so the pace isn't set by one
-     * slow reply at a time.
-     */
-    private static String fetch(Kind k, List<String> left, String id, boolean usePost,
-                                Map<String, java.util.concurrent.Future<String>> inflight, int width) throws Exception {
-        if (width <= 1) {
-            inflight.clear();
-            return timed(k.url(id), usePost);
-        }
-        // Keep `width` requests actually running: finished answers waiting their turn don't count,
-        // so one slow reply at the front doesn't shrink what's in flight.
-        int running = 0;
-        for (java.util.concurrent.Future<String> f : inflight.values()) if (!f.isDone()) running++;
-        for (int i = 0; i < left.size() && running < width && i < width * 8; i++) {
-            String x = left.get(i);
-            if (inflight.containsKey(x)) continue;
-            final String u = k.url(x);
-            inflight.put(x, POOL.submit(() -> timed(u, usePost)));
-            running++;
-        }
-        java.util.concurrent.Future<String> f = inflight.remove(id);
-        if (f == null) return timed(k.url(id), usePost);
-        try {
-            return f.get(90, java.util.concurrent.TimeUnit.SECONDS);
-        } catch (java.util.concurrent.ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof Exception) throw (Exception) cause;
-            throw e;
-        }
-    }
-
-    /**
-     * After a refusal: the requests still in flight are collected, not counted as more refusals (one
-     * "no" from TikTok shows up in all of them at once). Any that went through count as removed.
-     */
-    private static int settle(Kind k, Map<String, java.util.concurrent.Future<String>> inflight,
-                              List<String> left, Set<String> done) {
-        int ok = 0;
-        for (Map.Entry<String, java.util.concurrent.Future<String>> e : inflight.entrySet()) {
-            try {
-                String raw = e.getValue().get(25, java.util.concurrent.TimeUnit.SECONDS);
-                if (new JSONObject(raw).optInt("status_code", -1) == 0 && left.remove(e.getKey())) {
-                    done.add(e.getKey());
-                    countToday(k);
-                    ok++;
-                }
-            } catch (Throwable ignored) {
-                // that one is simply asked again later
-            }
-        }
-        inflight.clear();
-        return ok;
-    }
-
-    private static String timed(String url, boolean usePost) throws Exception {
-        long t0 = System.nanoTime();
-        try {
-            return usePost ? post(url) : get(url);
-        } finally {
-            LAT_SUM.addAndGet((System.nanoTime() - t0) / 1_000_000L);
-            LAT_N.incrementAndGet();
-        }
-    }
-
-    /** Average milliseconds per request since the run began (0 until there is one). */
-    private static long avgMs(long sum0, long n0) {
-        long n = LAT_N.get() - n0;
-        return n <= 0 ? 0 : (LAT_SUM.get() - sum0) / n;
-    }
 
     private static long every(Kind k) {
         return (k == Kind.LIKES ? LIKES_MS : FAV_MS)[speed()];
@@ -323,8 +248,8 @@ public final class FavoritesTools {
         String[] labels = {
                 "Normal: about 1.5 s each (the gentlest)",
                 "Fast: about 0.3 s each",
-                "Very fast: 3 at a time, up to 6 while TikTok says yes",
-                "Max: 4 at a time, up to 12 while TikTok says yes (finds its own speed)",
+                "Very fast: 4 at a time, up to 8 while TikTok says yes",
+                "Max: 8 at a time, up to 24 while TikTok says yes (finds its own speed)",
         };
         new AlertDialog.Builder(activity)
                 .setTitle("Removing speed")
@@ -794,129 +719,208 @@ public final class FavoritesTools {
         }
     }
 
+    /** One request's answer: TikTok's status (0 is yes), or the error if there was no answer at all. */
+    private static final class Answer {
+        final String id;
+        final int code;
+        final String msg;
+        final String raw;
+        final Throwable error;
+        final long ms;
+
+        Answer(String id, int code, String msg, String raw, Throwable error, long ms) {
+            this.id = id;
+            this.code = code;
+            this.msg = msg;
+            this.raw = raw;
+            this.error = error;
+            this.ms = ms;
+        }
+    }
+
+    private static Answer ask(String id, String url, boolean usePost) {
+        long t = System.currentTimeMillis();
+        try {
+            String raw = usePost ? post(url) : get(url);
+            long ms = System.currentTimeMillis() - t;
+            try {
+                JSONObject r = new JSONObject(raw);
+                return new Answer(id, r.optInt("status_code", -1), r.optString("status_msg", ""), raw, null, ms);
+            } catch (Exception notJson) {
+                return new Answer(id, -1, "", raw, new java.io.IOException(
+                        "not TikTok's answer (" + String.valueOf(raw).length() + " chars)"), ms);
+            }
+        } catch (Throwable e) {
+            return new Answer(id, -1, "", null, e, System.currentTimeMillis() - t);
+        }
+    }
+
+    /** TikTok asking to slow down, as opposed to a "no" about one video (deleted, private, gone). */
+    private static boolean slowDown(String msg) {
+        String m = msg.toLowerCase(Locale.ROOT);
+        return m.contains("frequen") || m.contains("too fast") || m.contains("too many") || m.contains("slow down")
+                || m.contains("rate limit") || m.contains("limit") || m.contains("busy") || m.contains("later")
+                || m.contains("wait");
+    }
+
+    private static boolean aboutTheVideo(String msg) {
+        String m = msg.toLowerCase(Locale.ROOT);
+        return m.contains("unavailable") || m.contains("not available") || m.contains("no longer") || m.contains("deleted")
+                || m.contains("doesn't exist") || m.contains("does not exist") || m.contains("not exist")
+                || m.contains("private") || m.contains("removed") || m.contains("not found");
+    }
+
+    private static List<String> pendingNow(java.util.Collection<String> flying, java.util.Collection<String> queue) {
+        List<String> l = new ArrayList<>(flying.size() + queue.size());
+        l.addAll(flying);
+        l.addAll(queue);
+        return l;
+    }
+
+    /**
+     * The removal engine. Requests go out side by side (how many at once climbs while TikTok keeps
+     * saying yes) and each answer is dealt with as it arrives, so one slow reply holds nothing up.
+     * A "no" about one video (deleted, private) just sets that video aside; only TikTok asking to slow
+     * down, or a run of noes, brings a pause, and one pause covers a whole burst of them.
+     */
     private static void removeAllOn(Kind k) {
-        List<String> left = new ArrayList<>(pending(k));
-        for (java.util.Iterator<String> it = left.iterator(); it.hasNext(); ) if (it.next().isEmpty()) it.remove();   // the "continue" placeholder: likes are read from the list
-        // Likes: the target count; as the found ones go, the Liked list's top is read again.
-        int target = k == Kind.LIKES ? Math.max(left.size(), targetLeft(k)) : left.size();
+        java.util.ArrayDeque<String> queue = new java.util.ArrayDeque<>();
+        for (String id : pending(k)) if (!id.isEmpty()) queue.add(id);   // "" is the "continue" placeholder
+        // Likes from the list: the target count; as the found ones go, the Liked list's top is read again.
+        int target = k == Kind.LIKES ? Math.max(queue.size(), targetLeft(k)) : queue.size();
         Set<String> done = new HashSet<>();
         int allowance = k.daily - doneToday(k);
         if (allowance <= 0) {
             ended(k, "Today's limit of " + fmt(k.daily) + " " + k.noun + " is reached. "
-                    + fmt(left.size()) + " left: long-press Posts tomorrow to continue.");
+                    + fmt(queue.size()) + " left: long-press Posts tomorrow to continue.");
             return;
         }
         int total = Math.min(target, allowance);
-        int removed = 0;
-        int inARow = 0;
+        int removed = 0, failed = 0;
         boolean usePost = k.post, triedPost = k.post;
         Map<String, Integer> tries = new HashMap<>();
-        Map<String, java.util.concurrent.Future<String>> inflight = new HashMap<>();
+        Map<String, Integer> reasons = new java.util.LinkedHashMap<>();
+        Set<String> flying = new java.util.LinkedHashSet<>();
+        java.util.concurrent.ExecutorCompletionService<Answer> answers = new java.util.concurrent.ExecutorCompletionService<>(POOL);
+        int width = WIDTH[speed()];
+        int ceiling = MAX_WIDTH[speed()];
+        int yesRun = 0, noRun = 0, pauses = 0, yesSincePause = 0, pausesWithoutYes = 0;
+        long holdUntil = 0, offlineSince = 0, lastSave = System.currentTimeMillis();
+        long replyMs = 0;
+        int replies = 0;
         long startedAt = System.currentTimeMillis();
-        int noAnswer = 0;
-        double pace = 1.0;
-        int width = WIDTH[speed()];                  // requests in flight; climbs while TikTok says yes
-        int ceiling = MAX_WIDTH[speed()];            // lowered a notch whenever a "no" came at a width
-        int yesRun = 0;                              // yeses in a row since the last "no"
-        long lastSave = System.currentTimeMillis();
-        final long latSum0 = LAT_SUM.get(), latN0 = LAT_N.get();
         boolean dried = false;
         List<String> firstDone = new ArrayList<>();
         boolean checked = k != Kind.LIKES || fromFile;
-        // From a data file, the newest ids may already be unliked (done by hand since it was made):
-        // until the first one really goes, refusals are skipped over, not counted as TikTok saying no.
-        List<String> skipped = new ArrayList<>();
         Utils.showToastLong("Removing " + fmt(total) + " " + k.noun + "… (progress in your notifications)");
         String title = "Removing " + k.noun;
         ToolNotice.note(title, "Starting: 0 of " + fmt(total), 0, total);
         while (true) {
-            if (left.isEmpty()) {
-                if (k != Kind.LIKES || removed >= target || fromFile) break;
-                List<String> more = refillLikes(done, target - removed, removed, total, title);
-                if (more.isEmpty()) {
-                    dried = true;
-                    break;
+            long now = System.currentTimeMillis();
+            int goal = Math.min(target, allowance);
+            if (now >= holdUntil) {
+                while (flying.size() < width && !queue.isEmpty() && removed + flying.size() < goal) {
+                    final String id = queue.poll();
+                    if (done.contains(id) || flying.contains(id)) continue;
+                    flying.add(id);
+                    final String url = k.url(id);
+                    final boolean p = usePost;
+                    answers.submit(() -> ask(id, url, p));
                 }
-                left.addAll(more);
             }
-            if (removed >= target) break;
-            if (removed >= allowance) {
-                savePending(k, left);
-                saveTarget(k, target - removed);
-                ended(k, "Removed " + fmt(removed) + " " + k.noun + ": today's limit. "
-                        + fmt(k == Kind.LIKES ? target - removed : left.size()) + " left: long-press Posts tomorrow to continue.");
-                return;
-            }
-            String id = left.get(0);
-            String why;
-            boolean offline = false;
-            try {
-                String url = k.url(id);
-                String raw = fetch(k, left, id, usePost, inflight, pace > 1.0 ? 1 : width);
-                JSONObject r;
-                try {
-                    r = new JSONObject(raw);
-                } catch (Exception notJson) {
-                    throw new java.io.IOException("not TikTok's answer (" + String.valueOf(raw).length() + " chars)");
-                }
-                int code = r.optInt("status_code", -1);
-                if (code != 0 && !triedPost) {
-                    // Not the way that worked so far: try the other (GET/POST) once, keep what works.
-                    triedPost = true;
-                    Cleancut.favLog(k.noun + (usePost ? " POST " : " GET ") + id + ": " + raw);
-                    try {
-                        String raw2 = usePost ? get(url) : post(url);
-                        Cleancut.favLog(k.noun + (usePost ? " GET " : " POST ") + id + ": " + raw2);
-                        JSONObject r2 = new JSONObject(raw2);
-                        if (r2.optInt("status_code", -1) == 0) { usePost = !usePost; r = r2; code = 0; }
-                    } catch (Throwable t) {
-                        Cleancut.favLog(k.noun + " POST " + id + ": " + t);
-                    }
-                }
-                String msg = r.optString("status_msg", "");
-                why = code == 0 ? null : (msg.isEmpty() ? "status " + code : msg);
-            } catch (Throwable t) {
-                // No answer at all (no signal, screen off, the app paused): not TikTok saying no.
-                why = String.valueOf(t.getMessage());
-                offline = true;
-            }
-            if (offline) {
-                if (++noAnswer == 1) Cleancut.favLog("no answer, waiting: " + why);
-                if (noAnswer % 6 == 1) {
-                    boolean away = String.valueOf(why).contains("background");
-                    String wait = away ? "Paused: open the TT test again to carry on" : "No connection, waiting for it to come back…";
-                    Utils.showToastShort(wait);
-                    ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · " + wait, removed, total);
-                }
-                if (noAnswer >= 180) {     // half an hour with no answer: stop, keep the place
-                    savePending(k, left);
+            if (flying.isEmpty()) {
+                if (removed >= target) break;
+                if (removed >= allowance) {
+                    savePending(k, pendingNow(flying, queue));
                     saveTarget(k, target - removed);
-                    ended(k, "Stopped after " + fmt(removed) + ": no connection for half an hour. "
-                            + "Long-press Posts to continue.");
+                    ended(k, "Removed " + fmt(removed) + " " + k.noun + ": today's limit. "
+                            + fmt(k == Kind.LIKES ? target - removed : queue.size()) + " left: long-press Posts tomorrow to continue.");
                     return;
                 }
-                sleep(10_000);
+                if (now < holdUntil) {
+                    sleep(Math.min(1000, holdUntil - now));
+                    continue;
+                }
+                if (queue.isEmpty()) {
+                    if (k != Kind.LIKES || fromFile) break;
+                    List<String> more = refillLikes(done, target - removed, removed, total, title);
+                    if (more.isEmpty()) {
+                        dried = true;
+                        break;
+                    }
+                    queue.addAll(more);
+                }
                 continue;
             }
-            noAnswer = 0;
-            if (why == null) {
-                left.remove(0);
-                done.add(id);
-                if (removed == 0 && !skipped.isEmpty()) {
-                    Cleancut.favLog("file run: skipped " + skipped.size() + " already gone, then removals began");
-                    Utils.showToastShort("Skipped " + fmt(skipped.size()) + " that were already unliked.");
-                    skipped.clear();
+            Answer a;
+            try {
+                java.util.concurrent.Future<Answer> f = answers.poll(1, java.util.concurrent.TimeUnit.SECONDS);
+                if (f == null) continue;
+                a = f.get();
+            } catch (Exception e) {
+                continue;
+            }
+            flying.remove(a.id);
+            now = System.currentTimeMillis();
+
+            if (a.error != null) {
+                // No answer at all (no signal, the app paused): not TikTok saying no. Ask again later.
+                queue.addFirst(a.id);
+                if (offlineSince == 0) {
+                    offlineSince = now;
+                    Cleancut.favLog("no answer, waiting: " + a.error);
                 }
+                width = Math.max(1, Math.min(width, 2));
+                if (now >= holdUntil) {
+                    holdUntil = now + 10_000;
+                    boolean away = String.valueOf(a.error.getMessage()).contains("background");
+                    String wait = away ? "Paused: open the TT test again to carry on" : "No connection, waiting for it to come back…";
+                    ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · " + wait, removed, total);
+                }
+                if (now - offlineSince > 30 * 60_000L) {
+                    savePending(k, pendingNow(flying, queue));
+                    saveTarget(k, target - removed);
+                    ended(k, "Stopped after " + fmt(removed) + ": no connection for half an hour. Long-press Posts to continue.");
+                    return;
+                }
+                continue;
+            }
+            offlineSince = 0;
+            replyMs += a.ms;
+            replies++;
+
+            int code = a.code;
+            String msg = a.msg;
+            if (code != 0 && !triedPost) {
+                // Not the way that worked so far: try the other (GET/POST) once, keep what works.
+                triedPost = true;
+                Cleancut.favLog(k.noun + (usePost ? " POST " : " GET ") + a.id + ": " + a.raw);
+                Answer b = ask(a.id, k.url(a.id), !usePost);
+                Cleancut.favLog(k.noun + (usePost ? " GET " : " POST ") + a.id + ": " + (b.error != null ? b.error : b.raw));
+                if (b.error == null && b.code == 0) {
+                    usePost = !usePost;
+                    code = 0;
+                }
+            }
+
+            if (code == 0) {
+                done.add(a.id);
                 removed++;
-                inARow = 0;
                 countToday(k);
-                if (firstDone.size() < 3) firstDone.add(id);
+                noRun = 0;
+                yesRun++;
+                yesSincePause++;
+                pausesWithoutYes = 0;
+                if (yesRun % 40 == 0) pauses = Math.max(0, pauses - 1);
+                if (yesRun % 10 == 0 && width < ceiling) width++;                       // quicker while it's all yes
+                if (yesRun % 300 == 0 && ceiling < MAX_WIDTH[speed()]) ceiling++;     // and try a notch higher again
+                if (firstDone.size() < 3) firstDone.add(a.id);
                 if (!checked && firstDone.size() == 3) {
                     // TikTok said yes three times: check the three really left your Liked list.
                     checked = true;
                     String stuck = stillLiked(firstDone);
                     if (stuck != null) {
-                        savePending(k, left);
+                        savePending(k, pendingNow(flying, queue));
                         saveTarget(k, target - removed);
                         Cleancut.favLog("likes said removed but still in the Liked list: " + stuck);
                         ended(k, "Stopped: TikTok said yes but those likes are still there. Nothing else was "
@@ -924,107 +928,104 @@ public final class FavoritesTools {
                         return;
                     }
                 }
-                if (++yesRun % 10 == 0 && width < ceiling && pace <= 1.0) width = Math.min(ceiling, width + 2);       // quicker while it's all yes
-                if (yesRun % 400 == 0 && ceiling < MAX_WIDTH[speed()]) ceiling++;       // and try the higher ceiling again
-                if (removed % 40 == 0 || System.currentTimeMillis() - lastSave > 6000) {
-                    savePending(k, left);
-                    lastSave = System.currentTimeMillis();
+                if (removed % 50 == 0 || now - lastSave > 5000) {
+                    savePending(k, pendingNow(flying, queue));
+                    lastSave = now;
                 }
-                if (removed % 200 == 0) {
-                    long ranNow = Math.max(1, System.currentTimeMillis() - startedAt);
-                    Cleancut.favLog("rate: " + removed + " in " + (ranNow / 1000) + "s = "
-                            + Math.round(removed * 60000.0 / ranNow) + "/min, at " + width + " at once (ceiling " + ceiling
-                            + "), average reply " + avgMs(latSum0, latN0) + " ms");
+                long ran = now - startedAt;
+                ToolNotice.progress(title, fmt(removed) + " of " + fmt(total)
+                        + (ran > 15_000 ? " · " + Math.round(removed * 60000.0 / ran) + "/min" : "")
+                        + (flying.size() + 1 > 1 ? " · " + width + " at once" : "")
+                        + (replies > 0 ? String.format(Locale.ROOT, " · reply %.1fs", replyMs / 1000.0 / replies) : "")
+                        + (failed > 0 ? " · " + fmt(failed) + " skipped" : ""), removed, total);
+                if (replies >= 200) {    // a moving average
+                    replyMs = replyMs / 2;
+                    replies = replies / 2;
                 }
-                if (removed % 50 == 0) Utils.showToastShort("Removed " + fmt(removed) + " of " + fmt(total) + " " + k.noun + "…");
-                long ran = System.currentTimeMillis() - startedAt;
-                ToolNotice.progress(title, fmt(removed) + " of " + fmt(total) + " · "
-                        + (ran > 20_000 ? Math.round(removed * 60000.0 / ran) + "/min · " : "")
-                        + (width > 1 && pace <= 1.0 ? width + " at once · " : "")
-                        + (LAT_N.get() - latN0 >= 20 ? String.format(java.util.Locale.US, "%.1fs each · ", avgMs(latSum0, latN0) / 1000.0) : "")
-                        + "about " + minutes(k, Math.max(0, total - removed)) + " left", removed, total);
-                // Quick while TikTok says yes; any "no" slows it (pace), and it speeds up again as yeses return.
-                if (removed % 25 == 0 && pace > 1.0) pace = Math.max(1.0, pace - 0.25);
-                long base = every(k);
-                long gap = base == 0 ? 0 : base + RANDOM.nextInt((int) (base / 3 + 50));
-                // A refusal slows it whatever the speed (even at Max), and it eases back as yeses return.
-                sleep((long) (gap * pace) + (long) (400 * (pace - 1.0)));
+                long gap = every(k);
+                if (gap > 0) holdUntil = Math.max(holdUntil, now + gap + RANDOM.nextInt((int) (gap / 3 + 50)));
                 continue;
             }
-            if (fromFile && removed == 0) {
-                skipped.add(id);
-                left.remove(0);
-                if (skipped.size() == 1) Cleancut.favLog("file run: first refusal, skipping ahead: " + id + ": " + why);
-                if (skipped.size() >= 1500) {
-                    left.addAll(0, skipped);        // nothing at all went: keep every one
-                    savePending(k, left);
-                    saveTarget(k, target);
-                    ended(k, "Stopped: TikTok refused the first 1,500 in the file (" + why + "), so nothing was removed. "
-                            + "The details are in cleancut-favourites.txt for Claude.");
-                    return;
-                }
-                if (skipped.size() % 25 == 0) {
-                    ToolNotice.note(title, "Skipping likes that are already gone: " + fmt(skipped.size()) + " so far…", 0, total);
-                }
-                sleep(250 + RANDOM.nextInt(250));
-                continue;
-            }
-            Cleancut.favLog("remove " + k.noun + " " + id + ": " + why + (width > 1 ? " (at " + width + " at once)" : ""));
-            if (inflight.size() > 0) {
-                int ok = settle(k, inflight, left, done);
-                removed += ok;
-            }
-            if (width > 1) ceiling = Math.max(1, Math.min(ceiling, width - 1));
-            width = Math.max(1, width / 2);
+
+            // TikTok said no.
+            String why = msg.isEmpty() ? "status " + code : msg;
+            noRun++;
             yesRun = 0;
-            pace = Math.min(5.0, pace + 1.0);
-            inARow++;
-            left.remove(0);
-            int t = tries.containsKey(id) ? tries.get(id) + 1 : 1;
-            tries.put(id, t);
-            if (t < 3) left.add(id);          // later in the run, once more
-            else done.add(id);
-            if (inARow >= 6 && removed == 0) {
-                // Refused from the very first one: not TikTok slowing things down, something's wrong.
-                savePending(k, left);
+            boolean slow = slowDown(msg) || (noRun >= 6 && !aboutTheVideo(msg));
+            if (slow) {
+                queue.addFirst(a.id);                     // not this video's fault: ask again after the pause
+                if (now >= holdUntil) {
+                    if (yesSincePause == 0) pausesWithoutYes++;
+                    yesSincePause = 0;
+                    pauses++;
+                    ceiling = Math.max(1, Math.min(ceiling, width - 1));
+                    width = Math.max(1, width / 2);
+                    long[] waits = {3_000, 10_000, 30_000, 60_000, 120_000, 300_000};
+                    long wait = waits[Math.min(pauses - 1, waits.length - 1)];
+                    holdUntil = now + wait;
+                    Cleancut.favLog("slow down (" + why + ") at " + (width * 2) + " at once, pausing " + (wait / 1000) + "s");
+                    ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · TikTok asked to slow down, pausing "
+                            + (wait / 1000) + "s…", removed, total);
+                    if (pausesWithoutYes >= 8) {
+                        savePending(k, pendingNow(flying, queue));
+                        saveTarget(k, target - removed);
+                        ended(k, "Stopped after " + fmt(removed) + " (TikTok: " + why + "). "
+                                + "Long-press Posts to continue whenever you like.");
+                        return;
+                    }
+                }
+                continue;
+            }
+            // A "no" about this one video: try it once more near the end, then set it aside.
+            int t = tries.containsKey(a.id) ? tries.get(a.id) + 1 : 1;
+            tries.put(a.id, t);
+            if (t < 2) {
+                queue.addLast(a.id);
+            } else {
+                failed++;
+                done.add(a.id);
+                Integer c = reasons.get(why);
+                reasons.put(why, c == null ? 1 : c + 1);
+                if (c == null) Cleancut.favLog("set aside " + k.noun + " " + a.id + ": " + why);
+            }
+            if (removed == 0 && failed >= 300) {
+                savePending(k, pendingNow(flying, queue));
                 saveTarget(k, target);
                 ended(k, "TikTok refused every one (" + why + "), so nothing was removed. "
                         + "The details are in cleancut-favourites.txt for Claude.");
                 return;
-            } else if (inARow >= 9) {
-                savePending(k, left);
-                saveTarget(k, target - removed);
-                ended(k, "Stopped after " + fmt(removed) + " (TikTok: " + why + "). "
-                        + "Long-press Posts to continue whenever you like.");
-                return;
-            } else if (inARow == 6) {
-                Utils.showToastLong("TikTok is still saying no, waiting 5 minutes… (" + why + ")");
-                ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · TikTok is saying no, waiting 5 minutes…",
-                        removed, total);
-                sleep(300_000);
-            } else if (inARow == 3) {
-                Utils.showToastLong("TikTok is slowing things down, waiting a minute… (" + why + ")");
-                ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · TikTok is slowing things down, waiting a minute…",
-                        removed, total);
-                sleep(60_000);
-            } else {
-                sleep(4_000);
             }
         }
+        StringBuilder skippedNote = new StringBuilder();
+        if (failed > 0) {
+            skippedNote.append(' ').append(fmt(failed)).append(" couldn't be removed (");
+            int n = 0;
+            for (Map.Entry<String, Integer> e : reasons.entrySet()) {
+                if (n++ == 3) break;
+                if (n > 1) skippedNote.append("; ");
+                skippedNote.append(e.getKey()).append(": ").append(fmt(e.getValue()));
+            }
+            skippedNote.append(").");
+            Cleancut.favLog(k.noun + " set aside: " + reasons);
+        }
+        long ran = Math.max(1, System.currentTimeMillis() - startedAt);
+        Cleancut.favLog(k.noun + " run: " + removed + " removed in " + (ran / 1000) + "s, " + failed + " set aside, "
+                + pauses + " pauses, ended at " + width + " at once");
         if (dried && removed < target) {
             // TikTok isn't listing any more right now: keep the place, don't call it done.
-            savePending(k, left);
+            savePending(k, pendingNow(flying, queue));
             saveTarget(k, target - removed);
             long now = likesNow();
             ended(k, "Removed " + fmt(removed) + " " + k.noun + " so far. TikTok isn't listing more of them right now"
                     + (now >= 0 ? " (it says you have " + fmt(now) + " likes)" : "")
-                    + ": long-press Posts in a few minutes and choose Continue.");
+                    + ": long-press Posts in a few minutes and choose Continue." + skippedNote);
             return;
         }
-        savePending(k, left);
+        savePending(k, new ArrayList<>());
         saveTarget(k, 0);
         long now = k == Kind.LIKES ? likesNow() : -1;
-        ended(k, "Done: removed " + fmt(removed) + " " + k.noun + "."
+        ended(k, "Done: removed " + fmt(removed) + " " + k.noun + " in " + Math.max(1, Math.round(ran / 60000.0)) + " min."
+                + skippedNote
                 + (now >= 0 ? " You now have " + fmt(now) + " likes." : " Open the tab again to see the new count."));
     }
 
