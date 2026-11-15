@@ -133,6 +133,13 @@ public final class FavoritesTools {
         actions.add(FavoritesTools::pickLikes);
         labels.add("Favourites: remove the ones from my TikTok data file");
         actions.add(() -> importFile(Kind.FAVOURITES));
+        int foundCount = foundLikes().size();
+        if (foundCount > 0) {
+            labels.add("Liked: unlike the " + fmt(foundCount) + " found likes");
+            actions.add(FavoritesTools::unlikeFound);
+        }
+        labels.add("Liked: look back through the years for hidden likes");
+        actions.add(FavoritesTools::sweepLikes);
         int setAside = gone().size();
         if (setAside > 0) {
             labels.add("Liked: try the " + fmt(setAside) + " set-aside likes again");
@@ -432,6 +439,167 @@ public final class FavoritesTools {
                         .show();
             });
         });
+    }
+
+    /**
+     * Looks for likes TikTok stopped listing: asks the Liked list (and the plain likes list) for pages
+     * at hand-set dates, twice a month back to 2016, in each unit TikTok's pointers use, and follows
+     * any page that answers. Anything found is kept to unlike from the menu.
+     */
+    private static void sweepLikes() {
+        work("Looking back through the years for hidden likes…", () -> {
+            knowMe();
+            Set<String> seen = new HashSet<>();
+            List<String> found = new ArrayList<>();
+            Map<String, Integer> byYear = new java.util.TreeMap<>();
+            StringBuilder notes = new StringBuilder();
+            int asked = 0, answered = 0, errors = 0, hidden = 0;
+            String lastError = "";
+            Calendar c = Calendar.getInstance();
+            c.set(Calendar.DAY_OF_MONTH, c.get(Calendar.DAY_OF_MONTH) > 15 ? 15 : 1);
+            c.set(Calendar.HOUR_OF_DAY, 0);
+            List<Long> points = new ArrayList<>();
+            while (c.get(Calendar.YEAR) >= 2016) {
+                points.add(c.getTimeInMillis());
+                if (c.get(Calendar.DAY_OF_MONTH) == 15) c.set(Calendar.DAY_OF_MONTH, 1);
+                else {
+                    c.add(Calendar.MONTH, -1);
+                    c.set(Calendar.DAY_OF_MONTH, 15);
+                }
+            }
+            String title = "Looking for hidden likes";
+            for (int i = 0; i < points.size(); i++) {
+                long ms = points.get(i);
+                String when = new SimpleDateFormat("MMM yyyy", Locale.US).format(new Date(ms));
+                ToolNotice.scan(title, when + " · " + fmt(found.size()) + " found", i, points.size());
+                // The Liked list the app uses (its pointer is in microseconds), then the plain list in each unit.
+                for (int way = 0; way < 4; way++) {
+                    long cursor = way == 0 ? ms * 1000 : way == 1 ? ms : way == 2 ? ms / 1000 : ms * 1000;
+                    for (int page = 0; page < 40; page++) {
+                        List<String> got = new ArrayList<>();
+                        long next = 0;
+                        boolean more = false;
+                        String err = null;
+                        for (int attempt = 0; attempt < 2; attempt++) {     // a hiccup is asked again once
+                            asked++;
+                            try {
+                                if (way == 0) {
+                                    FavoritesOrder.Page p = FavoritesOrder.likedPage(cursor, 30, ownUid, ownSecUid);
+                                    got.addAll(p.ids);
+                                    for (String x : p.invalid) {
+                                        got.add(x);
+                                        hidden++;
+                                    }
+                                    next = p.next;
+                                    more = p.more;
+                                } else {
+                                    String raw = get(HOST + "/aweme/v1/aweme/favorite/?user_id=" + ownUid + "&sec_user_id="
+                                            + ownSecUid + "&max_cursor=" + cursor + "&min_cursor=0&count=30");
+                                    JSONObject r = new JSONObject(raw);
+                                    if (r.optInt("status_code", -1) != 0) throw new Exception("status " + r.optInt("status_code", -1)
+                                            + " " + r.optString("status_msg", ""));
+                                    got.addAll(ids(r));
+                                    next = r.optLong("max_cursor", 0);
+                                    more = r.optInt("has_more", 0) == 1;
+                                }
+                                answered++;
+                                err = null;
+                                break;
+                            } catch (Throwable t) {
+                                err = String.valueOf(t.getMessage());
+                                sleep(1500);
+                            }
+                        }
+                        if (err != null) {
+                            errors++;
+                            lastError = err;
+                            break;
+                        }
+                        int fresh = 0;
+                        for (String id : got) {
+                            if (id != null && !id.isEmpty() && seen.add(id)) {
+                                found.add(id);
+                                fresh++;
+                                String y = new SimpleDateFormat("yyyy", Locale.US).format(new Date(ms));
+                                Integer n = byYear.get(y);
+                                byYear.put(y, n == null ? 1 : n + 1);
+                            }
+                        }
+                        if (fresh > 0 && notes.length() < 1500) {
+                            notes.append("\n  ").append(when).append(way == 0 ? " (Liked list)" : " (plain list, unit " + way + ")")
+                                    .append(": ").append(fresh).append(" new, more ").append(more).append(", next ").append(next);
+                        }
+                        // Follow a page that gave something; one that's empty ends this date's look.
+                        if (got.isEmpty() || next <= 0 || next == cursor) break;
+                        cursor = next;
+                        sleep(250);
+                    }
+                    sleep(200);
+                }
+                if (i % 10 == 9 && !found.isEmpty()) saveFound(found);
+            }
+            saveFound(found);
+            ToolNotice.clear();
+            long likes = likesNow();
+            String text = "Dates asked: " + points.size() + " (twice a month back to 2016), requests " + asked
+                    + ", answered " + answered + ", failed " + errors + (lastError.isEmpty() ? "" : " (last: " + lastError + ")")
+                    + ".\nLikes found: " + fmt(found.size()) + (hidden > 0 ? " (" + hidden + " listed as unavailable)" : "")
+                    + (byYear.isEmpty() ? "" : "\nBy year asked: " + byYear)
+                    + (notes.length() > 0 ? "\nWhere:" + notes : "")
+                    + "\nTikTok says you have " + (likes >= 0 ? fmt(likes) : "?") + " likes."
+                    + "\nTabs captured: " + FavoritesOrder.capturedInfo() + ".";
+            Cleancut.favLog("hidden likes sweep:\n" + text);
+            Utils.runOnMainThread(() -> {
+                Activity a = Utils.getVisibleActivity();
+                if (a == null) return;
+                AlertDialog.Builder b = new AlertDialog.Builder(a)
+                        .setTitle(found.isEmpty() ? "No hidden likes turned up" : fmt(found.size()) + " likes found")
+                        .setMessage((found.isEmpty()
+                                ? "TikTok didn't give any pages for those dates. It can change from day to day, so it's worth trying again later.\n\n"
+                                : "They're kept: choose \"Liked: unlike the found ones\" in the menu.\n\n") + text)
+                        .setNeutralButton("Copy details", (d, x) -> {
+                            try {
+                                android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                                        a.getSystemService(Context.CLIPBOARD_SERVICE);
+                                cm.setPrimaryClip(android.content.ClipData.newPlainText("TT test details", text));
+                                Utils.showToastShort("Copied");
+                            } catch (Throwable ignored) {
+                                // nothing to copy to
+                            }
+                        });
+                if (found.isEmpty()) b.setPositiveButton("OK", null);
+                else b.setPositiveButton("Unlike them now", (d, x) -> unlikeFound()).setNegativeButton("Later", null);
+                b.show();
+            });
+        });
+    }
+
+    private static List<String> foundLikes() {
+        SharedPreferences p = prefs();
+        List<String> out = new ArrayList<>();
+        if (p == null) return out;
+        for (String s : p.getString("likes_found", "").split(",")) if (!s.isEmpty()) out.add(s);
+        return out;
+    }
+
+    private static void saveFound(List<String> ids) {
+        SharedPreferences p = prefs();
+        if (p == null) return;
+        java.util.LinkedHashSet<String> all = new java.util.LinkedHashSet<>(foundLikes());
+        all.addAll(ids);
+        p.edit().putString("likes_found", android.text.TextUtils.join(",", all)).apply();
+    }
+
+    private static void unlikeFound() {
+        List<String> ids = foundLikes();
+        if (ids.isEmpty()) return;
+        likesWanted = ids.size();
+        setFromFile(true);
+        retryingGone = false;
+        SharedPreferences p = prefs();
+        if (p != null) p.edit().remove("likes_found").apply();     // the run takes them; set-aside ones are kept there
+        confirmRemove(Kind.LIKES, ids, "Unlike the " + fmt(ids.size()) + " found likes?",
+                "These turned up looking back through the years. " + plan(Kind.LIKES, ids.size()));
     }
 
     // --- speed ---------------------------------------------------------------------------------
