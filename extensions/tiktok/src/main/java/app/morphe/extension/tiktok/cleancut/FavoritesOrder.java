@@ -110,6 +110,7 @@ public final class FavoritesOrder {
                 else likedArgs = null;
             }
             SEEN_AT.put(type, System.currentTimeMillis());
+            FavoritesTools.resumeIfInterrupted();   // a removal TikTok's closing interrupted carries on
         }
         if (type != FAVORITES || INSIDE.get() || fetcher == null) return null;
         FavoritesTabs.attachSoon();

@@ -54,6 +54,8 @@ public final class FavoritesTools {
     private static final String HOST = "https://api16-va.tiktokv.com";
     private static final String PREFS = "cleancut_favorites";
     private static volatile boolean busy;
+    /** Set by "Stop removing": the only thing that ends a run early. */
+    private static volatile boolean stopAsked;
     /** How many likes the chosen run is for (the list is read again from the top as they go). */
     private static volatile int likesWanted;
     private static final Random RANDOM = new Random();
@@ -97,6 +99,13 @@ public final class FavoritesTools {
         if (activity == null) return;
         List<String> labels = new ArrayList<>();
         List<Runnable> actions = new ArrayList<>();
+        if (busy) {
+            labels.add("Stop removing (keeps its place)");
+            actions.add(() -> {
+                stopAsked = true;
+                Utils.showToastShort("Stopping…");
+            });
+        }
         for (Kind k : Kind.values()) {
             List<String> pending = pending(k);
             int count = k == Kind.LIKES ? Math.max(pending.size(), targetLeft(k)) : pending.size();
@@ -194,7 +203,7 @@ public final class FavoritesTools {
                 .setItems(choices, (d, which) -> {
                     int n = amounts[which];
                     likesWanted = n;
-                    fromFile = false;
+                    setFromFile(false);
                     work("Finding your " + fmt(n) + " most recent likes… (progress in your notifications)", () -> {
                         LikesScan scan = scanLikes(n, new HashSet<>(), true,
                                 (t, f, w) -> ToolNotice.scan("Finding your likes", t, f, w));
@@ -263,6 +272,46 @@ public final class FavoritesTools {
                 .show();
     }
 
+    private static void setFromFile(boolean on) {
+        fromFile = on;
+        SharedPreferences p = prefs();
+        if (p != null) p.edit().putBoolean("likes_from_file", on).apply();
+    }
+
+    /** A run that was going when TikTok closed (or the phone restarted) carries on by itself. */
+    private static void markRunning(Kind k, boolean on) {
+        SharedPreferences p = prefs();
+        if (p != null) p.edit().putBoolean(k.key + "_running", on).apply();
+    }
+
+    private static long lastResumeTry;
+
+    /** Called whenever a profile tab loads: picks an interrupted run back up, no menu needed. */
+    public static void resumeIfInterrupted() {
+        try {
+            if (busy) return;
+            long now = System.currentTimeMillis();
+            if (now - lastResumeTry < 20_000) return;
+            lastResumeTry = now;
+            SharedPreferences p = prefs();
+            if (p == null) return;
+            for (Kind k : Kind.values()) {
+                if (!p.getBoolean(k.key + "_running", false)) continue;
+                List<String> left = pending(k);
+                if (left.isEmpty() && targetLeft(k) <= 0) {
+                    markRunning(k, false);
+                    continue;
+                }
+                Cleancut.favLog("carrying on with " + k.noun + " (" + left.size() + " left)");
+                Utils.showToastShort("Carrying on removing " + k.noun + "…");
+                work(null, () -> removeAll(k));
+                return;
+            }
+        } catch (Throwable e) {
+            Cleancut.favLog("resume: " + e);
+        }
+    }
+
     /** Set while a run works from a data file: the Liked list isn't read again when the file's ids run out. */
     private static volatile boolean fromFile;
 
@@ -320,7 +369,7 @@ public final class FavoritesTools {
                 }
                 if (likes) {
                     likesWanted = ids.size();
-                    fromFile = true;
+                    setFromFile(true);
                 }
                 confirmRemove(kind, ids, (likes ? "Unlike " : "Remove from favourites: ") + fmt(ids.size()) + " videos from your file?",
                         "Newest first, by their ids, so TikTok's list isn't needed. " + plan(kind, ids.size()));
@@ -789,13 +838,13 @@ public final class FavoritesTools {
         // Likes from the list: the target count; as the found ones go, the Liked list's top is read again.
         int target = k == Kind.LIKES ? Math.max(queue.size(), targetLeft(k)) : queue.size();
         Set<String> done = new HashSet<>();
-        int allowance = k.daily - doneToday(k);
-        if (allowance <= 0) {
-            ended(k, "Today's limit of " + fmt(k.daily) + " " + k.noun + " is reached. "
-                    + fmt(queue.size()) + " left: long-press Posts tomorrow to continue.");
-            return;
+        if (k == Kind.LIKES) {
+            SharedPreferences fp = prefs();
+            if (fp != null && fp.getBoolean("likes_from_file", false)) fromFile = true;
         }
-        int total = Math.min(target, allowance);
+        markRunning(k, true);
+        stopAsked = false;
+        int total = target;
         int removed = 0, failed = 0;
         boolean usePost = k.post, triedPost = k.post;
         Map<String, Integer> tries = new HashMap<>();
@@ -816,10 +865,18 @@ public final class FavoritesTools {
         String title = "Removing " + k.noun;
         ToolNotice.note(title, "Starting: 0 of " + fmt(total), 0, total);
         while (true) {
+            if (stopAsked) {
+                stopAsked = false;
+                savePending(k, pendingNow(flying, queue));
+                saveTarget(k, target - removed);
+                markRunning(k, false);
+                ended(k, "Stopped after " + fmt(removed) + ", as you asked. Long-press Posts and choose Continue to carry on.");
+                return;
+            }
             long now = System.currentTimeMillis();
-            int goal = Math.min(target, allowance);
+            int room = k.daily - doneToday(k) - flying.size();   // today's limit; it carries on after midnight
             if (now >= holdUntil) {
-                while (flying.size() < width && !queue.isEmpty() && removed + flying.size() < goal) {
+                while (flying.size() < width && !queue.isEmpty() && removed + flying.size() < target && room-- > 0) {
                     final String id = queue.poll();
                     if (done.contains(id) || flying.contains(id)) continue;
                     flying.add(id);
@@ -830,12 +887,13 @@ public final class FavoritesTools {
             }
             if (flying.isEmpty()) {
                 if (removed >= target) break;
-                if (removed >= allowance) {
+                if (room <= 0 && !queue.isEmpty()) {
                     savePending(k, pendingNow(flying, queue));
                     saveTarget(k, target - removed);
-                    ended(k, "Removed " + fmt(removed) + " " + k.noun + ": today's limit. "
-                            + fmt(k == Kind.LIKES ? target - removed : queue.size()) + " left: long-press Posts tomorrow to continue.");
-                    return;
+                    ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · today's " + fmt(k.daily)
+                            + " done, carrying on after midnight", removed, total);
+                    sleep(60_000);
+                    continue;
                 }
                 if (now < holdUntil) {
                     sleep(Math.min(1000, holdUntil - now));
@@ -857,7 +915,8 @@ public final class FavoritesTools {
                 java.util.concurrent.Future<Answer> f = answers.poll(1, java.util.concurrent.TimeUnit.SECONDS);
                 if (f == null) continue;
                 a = f.get();
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                Cleancut.favLog("engine: " + e);
                 continue;
             }
             flying.remove(a.id);
@@ -877,11 +936,9 @@ public final class FavoritesTools {
                     String wait = away ? "Paused: open the TT test again to carry on" : "No connection, waiting for it to come back…";
                     ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · " + wait, removed, total);
                 }
-                if (now - offlineSince > 30 * 60_000L) {
-                    savePending(k, pendingNow(flying, queue));
-                    saveTarget(k, target - removed);
-                    ended(k, "Stopped after " + fmt(removed) + ": no connection for half an hour. Long-press Posts to continue.");
-                    return;
+                if (now - lastSave > 5000) {
+                    savePending(k, pendingNow(flying, queue));     // keeps waiting, with its place kept
+                    lastSave = now;
                 }
                 continue;
             }
@@ -923,6 +980,7 @@ public final class FavoritesTools {
                         savePending(k, pendingNow(flying, queue));
                         saveTarget(k, target - removed);
                         Cleancut.favLog("likes said removed but still in the Liked list: " + stuck);
+                        markRunning(k, false);
                         ended(k, "Stopped: TikTok said yes but those likes are still there. Nothing else was "
                                 + "touched; the details are in cleancut-favourites.txt for Claude.");
                         return;
@@ -951,7 +1009,9 @@ public final class FavoritesTools {
             String why = msg.isEmpty() ? "status " + code : msg;
             noRun++;
             yesRun = 0;
-            boolean slow = slowDown(msg) || (noRun >= 6 && !aboutTheVideo(msg));
+            boolean gone = aboutTheVideo(msg);
+            if (gone) noRun = Math.max(0, noRun - 1);        // a deleted video says nothing about pace
+            boolean slow = !gone && (slowDown(msg) || noRun >= 6);
             if (slow) {
                 queue.addFirst(a.id);                     // not this video's fault: ask again after the pause
                 if (now >= holdUntil) {
@@ -966,20 +1026,14 @@ public final class FavoritesTools {
                     Cleancut.favLog("slow down (" + why + ") at " + (width * 2) + " at once, pausing " + (wait / 1000) + "s");
                     ToolNotice.note(title, fmt(removed) + " of " + fmt(total) + " · TikTok asked to slow down, pausing "
                             + (wait / 1000) + "s…", removed, total);
-                    if (pausesWithoutYes >= 8) {
-                        savePending(k, pendingNow(flying, queue));
-                        saveTarget(k, target - removed);
-                        ended(k, "Stopped after " + fmt(removed) + " (TikTok: " + why + "). "
-                                + "Long-press Posts to continue whenever you like.");
-                        return;
-                    }
+                    savePending(k, pendingNow(flying, queue));      // it keeps going after the pause, whatever happens
                 }
                 continue;
             }
             // A "no" about this one video: try it once more near the end, then set it aside.
             int t = tries.containsKey(a.id) ? tries.get(a.id) + 1 : 1;
             tries.put(a.id, t);
-            if (t < 2) {
+            if (t < 2 && !gone) {
                 queue.addLast(a.id);
             } else {
                 failed++;
@@ -987,13 +1041,6 @@ public final class FavoritesTools {
                 Integer c = reasons.get(why);
                 reasons.put(why, c == null ? 1 : c + 1);
                 if (c == null) Cleancut.favLog("set aside " + k.noun + " " + a.id + ": " + why);
-            }
-            if (removed == 0 && failed >= 300) {
-                savePending(k, pendingNow(flying, queue));
-                saveTarget(k, target);
-                ended(k, "TikTok refused every one (" + why + "), so nothing was removed. "
-                        + "The details are in cleancut-favourites.txt for Claude.");
-                return;
             }
         }
         StringBuilder skippedNote = new StringBuilder();
@@ -1016,6 +1063,7 @@ public final class FavoritesTools {
             savePending(k, pendingNow(flying, queue));
             saveTarget(k, target - removed);
             long now = likesNow();
+            markRunning(k, false);
             ended(k, "Removed " + fmt(removed) + " " + k.noun + " so far. TikTok isn't listing more of them right now"
                     + (now >= 0 ? " (it says you have " + fmt(now) + " likes)" : "")
                     + ": long-press Posts in a few minutes and choose Continue." + skippedNote);
@@ -1024,6 +1072,7 @@ public final class FavoritesTools {
         savePending(k, new ArrayList<>());
         saveTarget(k, 0);
         long now = k == Kind.LIKES ? likesNow() : -1;
+        markRunning(k, false);
         ended(k, "Done: removed " + fmt(removed) + " " + k.noun + " in " + Math.max(1, Math.round(ran / 60000.0)) + " min."
                 + skippedNote
                 + (now >= 0 ? " You now have " + fmt(now) + " likes." : " Open the tab again to see the new count."));
