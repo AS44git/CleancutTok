@@ -133,6 +133,13 @@ public final class FavoritesTools {
         actions.add(FavoritesTools::pickLikes);
         labels.add("Favourites: remove the ones from my TikTok data file");
         actions.add(() -> importFile(Kind.FAVOURITES));
+        int setAside = gone().size();
+        if (setAside > 0) {
+            labels.add("Liked: try the " + fmt(setAside) + " set-aside likes again");
+            actions.add(FavoritesTools::retryGone);
+            labels.add("Liked: test other ways on the set-aside likes");
+            actions.add(FavoritesTools::probeGone);
+        }
         labels.add("Speed: " + SPEEDS[speed()] + " (tap to change)");
         actions.add(FavoritesTools::pickSpeed);
         labels.add("Liked: remove the likes from my TikTok data file");
@@ -204,6 +211,7 @@ public final class FavoritesTools {
                     int n = amounts[which];
                     likesWanted = n;
                     setFromFile(false);
+                    retryingGone = false;
                     work("Finding your " + fmt(n) + " most recent likes… (progress in your notifications)", () -> {
                         LikesScan scan = scanLikes(n, new HashSet<>(), true,
                                 (t, f, w) -> ToolNotice.scan("Finding your likes", t, f, w));
@@ -223,6 +231,207 @@ public final class FavoritesTools {
                     });
                 })
                 .show();
+    }
+
+    // --- likes TikTok won't remove (the video's gone) -----------------------------------------
+
+    private static List<String> gone() {
+        SharedPreferences p = prefs();
+        List<String> out = new ArrayList<>();
+        if (p == null) return out;
+        for (String s : p.getString("likes_gone", "").split(",")) if (!s.isEmpty()) out.add(s);
+        return out;
+    }
+
+    private static void saveGone(java.util.Collection<String> ids, boolean replace) {
+        SharedPreferences p = prefs();
+        if (p == null) return;
+        java.util.LinkedHashSet<String> all = new java.util.LinkedHashSet<>();
+        if (!replace) all.addAll(gone());
+        all.addAll(ids);
+        p.edit().putString("likes_gone", android.text.TextUtils.join(",", all)).apply();
+    }
+
+    /** Set when the set-aside ones are being tried again: the run starts their list afresh. */
+    private static volatile boolean retryingGone;
+
+    private static void retryGone() {
+        List<String> ids = gone();
+        if (ids.isEmpty()) return;
+        likesWanted = ids.size();
+        setFromFile(true);
+        retryingGone = true;
+        confirmRemove(Kind.LIKES, ids, "Try the " + fmt(ids.size()) + " set-aside likes again?",
+                "These are the ones TikTok refused (mostly \"Video has been removed\"). Any whose video is back "
+                        + "get unliked; the rest are kept for another try. " + plan(Kind.LIKES, ids.size()));
+    }
+
+    private static String code(String raw) {
+        try {
+            JSONObject r = new JSONObject(raw);
+            String m = r.optString("status_msg", "");
+            return r.optInt("status_code", -1) + (m.isEmpty() ? "" : " " + m);
+        } catch (Throwable e) {
+            return "not JSON: " + (raw == null ? "null" : raw.substring(0, Math.min(80, raw.length())));
+        }
+    }
+
+    private static String err(Throwable e) {
+        Throwable c = e instanceof java.lang.reflect.InvocationTargetException && e.getCause() != null ? e.getCause() : e;
+        return "error: " + c.getClass().getSimpleName() + (c.getMessage() == null ? "" : " " + c.getMessage());
+    }
+
+    /** TikTok's own way of sending a like: its Retrofit API, the one the heart button uses. */
+    private static String viaTikTok(String id) throws Exception {
+        Class<?> api = Class.forName("com.ss.android.ugc.aweme.feed.api.FeedActionApi");
+        java.lang.reflect.Field field = api.getDeclaredField("LIZIZ");
+        field.setAccessible(true);
+        Object retrofit = field.get(null);
+        Map<String, String> m = new HashMap<>();
+        m.put("aweme_id", id);
+        m.put("type", "0");
+        m.put("channel_id", "0");
+        Method call = Class.forName("com.ss.android.ugc.aweme.feed.api.FeedActionApi$RetrofitApi")
+                .getMethod("LIZIZ", Map.class);
+        Object future = call.invoke(retrofit, m);
+        Object resp = ((java.util.concurrent.Future<?>) future).get(20, java.util.concurrent.TimeUnit.SECONDS);
+        int sc = -1;
+        String msg = "";
+        for (Class<?> c = resp.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                f.setAccessible(true);
+                if (f.getName().equals("status_code")) sc = ((Number) f.get(resp)).intValue();
+                if (f.getName().equals("status_msg") && f.get(resp) != null) msg = String.valueOf(f.get(resp));
+            }
+        }
+        return "{\"status_code\":" + sc + ",\"status_msg\":" + JSONObject.quote(msg) + "}";
+    }
+
+    /** The API host TikTok itself is using right now (it picks one per region). */
+    private static String tiktokHost() {
+        try {
+            java.lang.reflect.Field f1 = Class.forName("X.02r9").getDeclaredField("LJIIIIZZ");
+            f1.setAccessible(true);
+            Object cfg = f1.get(null);
+            java.lang.reflect.Field f2 = cfg.getClass().getDeclaredField("LIZ");
+            f2.setAccessible(true);
+            Object h = f2.get(cfg);
+            if (h != null && !String.valueOf(h).isEmpty()) return "https://" + h;
+        } catch (Throwable ignored) {
+            // not this version's layout
+        }
+        return null;
+    }
+
+    private interface Way {
+        String send(String id) throws Exception;
+    }
+
+    /**
+     * Tries the set-aside likes every other way TikTok's app could send an unlike, a few videos
+     * each, and says which (if any) TikTok accepts.
+     */
+    private static void probeGone() {
+        List<String> all = gone();
+        if (all.isEmpty()) return;
+        List<String> ids = all.subList(0, Math.min(4, all.size()));
+        work("Testing other ways on " + ids.size() + " set-aside likes…", () -> {
+            final String digg = "/aweme/v1/commit/item/digg/?type=0&aweme_id=";
+            final String extra = "&channel_id=0&enter_from=personal_homepage&previous_page=personal_homepage";
+            List<String> names = new ArrayList<>();
+            List<Way> ways = new ArrayList<>();
+            names.add("the usual (POST)");
+            ways.add(id -> post(HOST + digg + id));
+            names.add("GET");
+            ways.add(id -> get(HOST + digg + id));
+            names.add("with the app's extra fields");
+            ways.add(id -> post(HOST + digg + id + extra));
+            names.add("TikTok's own like button route");
+            ways.add(FavoritesTools::viaTikTok);
+            String own = tiktokHost();
+            if (own != null && !own.equals(HOST)) {
+                names.add("TikTok's current server (" + own.replace("https://", "") + ")");
+                ways.add(id -> post(own + digg + id));
+            }
+            for (String h : new String[]{"api16-normal-c-useast1a.tiktokv.com", "api22-normal-c-alisg.tiktokv.com",
+                    "api16-normal-c-alisg.tiktokv.com", "api.tiktokv.com"}) {
+                names.add("server " + h);
+                ways.add(id -> post("https://" + h + digg + id));
+            }
+            names.add("unlogged digg");
+            ways.add(id -> post(HOST + "/aweme/v1/unlogged/digg/?type=0&aweme_id=" + id));
+
+            StringBuilder report = new StringBuilder();
+            List<String> worked = new ArrayList<>();
+            Set<String> freed = new HashSet<>();
+            int step = 0;
+            int steps = ways.size() * ids.size() + ids.size();
+            report.append("Videos: ");
+            for (String id : ids) {
+                String detail;
+                try {
+                    detail = code(get(HOST + "/aweme/v1/aweme/detail/?aweme_id=" + id));
+                } catch (Throwable e) {
+                    detail = err(e);
+                }
+                report.append("\n  ").append(id).append(": ").append(detail);
+                ToolNotice.scan("Testing set-aside likes", "Looking at the videos…", ++step, steps);
+            }
+            for (int w = 0; w < ways.size(); w++) {
+                int yes = 0;
+                StringBuilder line = new StringBuilder();
+                for (String id : ids) {
+                    if (freed.contains(id)) continue;
+                    String r;
+                    try {
+                        r = code(ways.get(w).send(id));
+                    } catch (Throwable e) {
+                        r = err(e);
+                    }
+                    if (r.startsWith("0")) {
+                        yes++;
+                        freed.add(id);
+                    }
+                    line.append("\n    ").append(id).append(": ").append(r);
+                    ToolNotice.scan("Testing set-aside likes", names.get(w) + "…", ++step, steps);
+                    sleep(300);
+                }
+                report.append("\n").append(names.get(w)).append(": ").append(yes).append(" yes").append(line);
+                if (yes > 0) worked.add(names.get(w));
+            }
+            long likes = likesNow();
+            report.append("\nTikTok says you have ").append(likes >= 0 ? fmt(likes) : "?").append(" likes now.");
+            Cleancut.favLog("set-aside test:\n" + report);
+            ToolNotice.clear();
+            if (!freed.isEmpty()) {
+                List<String> rest = new ArrayList<>(all);
+                rest.removeAll(freed);
+                saveGone(rest, true);
+            }
+            String text = report.toString();
+            String head = worked.isEmpty()
+                    ? "None of the other ways got a yes for these videos."
+                    : "A yes from: " + android.text.TextUtils.join(", ", worked) + ". Send this to Claude to build it in.";
+            Utils.runOnMainThread(() -> {
+                Activity a = Utils.getVisibleActivity();
+                if (a == null) return;
+                new AlertDialog.Builder(a)
+                        .setTitle("Set-aside likes: test")
+                        .setMessage(head + "\n\n" + text)
+                        .setPositiveButton("OK", null)
+                        .setNeutralButton("Copy details", (d, x) -> {
+                            try {
+                                android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                                        a.getSystemService(Context.CLIPBOARD_SERVICE);
+                                cm.setPrimaryClip(android.content.ClipData.newPlainText("TT test details", head + "\n\n" + text));
+                                Utils.showToastShort("Copied");
+                            } catch (Throwable ignored) {
+                                // nothing to copy to
+                            }
+                        })
+                        .show();
+            });
+        });
     }
 
     // --- speed ---------------------------------------------------------------------------------
@@ -370,6 +579,7 @@ public final class FavoritesTools {
                 if (likes) {
                     likesWanted = ids.size();
                     setFromFile(true);
+                    retryingGone = false;
                 }
                 confirmRemove(kind, ids, (likes ? "Unlike " : "Remove from favourites: ") + fmt(ids.size()) + " videos from your file?",
                         "Newest first, by their ids, so TikTok's list isn't needed. " + plan(kind, ids.size()));
@@ -844,6 +1054,11 @@ public final class FavoritesTools {
         }
         markRunning(k, true);
         stopAsked = false;
+        List<String> setAsideNow = new ArrayList<>();
+        if (k == Kind.LIKES && retryingGone) {
+            retryingGone = false;
+            saveGone(new ArrayList<>(), true);     // this run decides which stay set aside
+        }
         int total = target;
         int removed = 0, failed = 0;
         boolean usePost = k.post, triedPost = k.post;
@@ -870,6 +1085,7 @@ public final class FavoritesTools {
                 savePending(k, pendingNow(flying, queue));
                 saveTarget(k, target - removed);
                 markRunning(k, false);
+                if (!setAsideNow.isEmpty()) saveGone(setAsideNow, false);
                 ended(k, "Stopped after " + fmt(removed) + ", as you asked. Long-press Posts and choose Continue to carry on.");
                 return;
             }
@@ -981,6 +1197,7 @@ public final class FavoritesTools {
                         saveTarget(k, target - removed);
                         Cleancut.favLog("likes said removed but still in the Liked list: " + stuck);
                         markRunning(k, false);
+                        if (!setAsideNow.isEmpty()) saveGone(setAsideNow, false);
                         ended(k, "Stopped: TikTok said yes but those likes are still there. Nothing else was "
                                 + "touched; the details are in cleancut-favourites.txt for Claude.");
                         return;
@@ -988,6 +1205,10 @@ public final class FavoritesTools {
                 }
                 if (removed % 50 == 0 || now - lastSave > 5000) {
                     savePending(k, pendingNow(flying, queue));
+                    if (!setAsideNow.isEmpty()) {
+                        saveGone(setAsideNow, false);
+                        setAsideNow.clear();
+                    }
                     lastSave = now;
                 }
                 long ran = now - startedAt;
@@ -1038,6 +1259,7 @@ public final class FavoritesTools {
             } else {
                 failed++;
                 done.add(a.id);
+                if (k == Kind.LIKES) setAsideNow.add(a.id);
                 Integer c = reasons.get(why);
                 reasons.put(why, c == null ? 1 : c + 1);
                 if (c == null) Cleancut.favLog("set aside " + k.noun + " " + a.id + ": " + why);
@@ -1064,6 +1286,7 @@ public final class FavoritesTools {
             saveTarget(k, target - removed);
             long now = likesNow();
             markRunning(k, false);
+            if (!setAsideNow.isEmpty()) saveGone(setAsideNow, false);
             ended(k, "Removed " + fmt(removed) + " " + k.noun + " so far. TikTok isn't listing more of them right now"
                     + (now >= 0 ? " (it says you have " + fmt(now) + " likes)" : "")
                     + ": long-press Posts in a few minutes and choose Continue." + skippedNote);
@@ -1073,6 +1296,7 @@ public final class FavoritesTools {
         saveTarget(k, 0);
         long now = k == Kind.LIKES ? likesNow() : -1;
         markRunning(k, false);
+        if (!setAsideNow.isEmpty()) saveGone(setAsideNow, false);
         ended(k, "Done: removed " + fmt(removed) + " " + k.noun + " in " + Math.max(1, Math.round(ran / 60000.0)) + " min."
                 + skippedNote
                 + (now >= 0 ? " You now have " + fmt(now) + " likes." : " Open the tab again to see the new count."));
